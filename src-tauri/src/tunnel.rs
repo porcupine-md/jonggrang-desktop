@@ -44,6 +44,17 @@ pub const FORWARD_LOCAL_PORT_BASE: u16 = 7778;
 /// can flow through the same [`AllocatedForward`] machinery as `-c` entries.
 pub const DASHBOARD_CONTAINER_ID: &str = "dashboard";
 
+/// Server-side host the dashboard forward connects to. The jonggrang dashboard
+/// runs on the docker host, which is reachable as `host.docker.internal` from
+/// inside the jonggrang server container, so the dashboard maps to
+/// `-L <local>:host.docker.internal:<remote>` rather than `localhost`.
+pub const DASHBOARD_FORWARD_HOST: &str = "host.docker.internal";
+
+/// Server-side host every other (`-c` container) forward connects to. These
+/// services listen on the server's own loopback, so they map to
+/// `-L <local>:localhost:<remote>`.
+pub const DEFAULT_FORWARD_HOST: &str = "localhost";
+
 /// A parsed `<user>@<server>` SSH target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelTarget {
@@ -89,6 +100,18 @@ impl AllocatedForward {
     /// The `localhost:<local_port>` URL authority a user opens in their browser.
     pub fn local_url(&self) -> String {
         format!("http://localhost:{}", self.local_port)
+    }
+
+    /// The host on the *server* side that `ssh` connects this forward to. The
+    /// dashboard lives on the docker host ([`DASHBOARD_FORWARD_HOST`]); every
+    /// container forward resolves against the server's own loopback
+    /// ([`DEFAULT_FORWARD_HOST`]).
+    pub fn forward_host(&self) -> &'static str {
+        if self.container_id == DASHBOARD_CONTAINER_ID {
+            DASHBOARD_FORWARD_HOST
+        } else {
+            DEFAULT_FORWARD_HOST
+        }
     }
 }
 
@@ -652,7 +675,10 @@ pub fn classify_ssh_log_line(line: &str) -> Option<SshLogSignal> {
 /// one forward, of the form:
 ///
 /// `-i <key> -N -v -o BatchMode=yes -o ExitOnForwardFailure=yes \
-///  -o ServerAliveInterval=15 -L <local>:localhost:<remote> <user>@<host>`
+///  -o ServerAliveInterval=15 -L <local>:<forward-host>:<remote> <user>@<host>`
+///
+/// The forward host is the dashboard's docker host for the dashboard forward and
+/// the server loopback for container forwards — see [`AllocatedForward::forward_host`].
 ///
 /// `BatchMode=yes` keeps a GUI app from hanging on a password prompt (key-only),
 /// and `ExitOnForwardFailure=yes` makes `ssh` exit (rather than linger) if the
@@ -671,7 +697,7 @@ pub fn build_ssh_args(target: &TunnelTarget, key_path: &Path, forward: &Allocate
         "-o".to_string(),
         "ServerAliveInterval=15".to_string(),
         "-L".to_string(),
-        format!("{}:localhost:{}", forward.local_port, forward.remote_port),
+        format!("{}:{}:{}", forward.local_port, forward.forward_host(), forward.remote_port),
         target.ssh_target(),
     ]
 }
@@ -1534,11 +1560,12 @@ mod lifecycle_tests {
         assert!(args.contains(&"-v".to_string()), "must include -v for status parsing");
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
-        assert!(args.contains(&"7777:localhost:7777".to_string()));
+        // The dashboard forward targets the docker host, not loopback.
+        assert!(args.contains(&"7777:host.docker.internal:7777".to_string()));
 
         // The -L value follows the -L flag.
         let l = args.iter().position(|a| a == "-L").expect("missing -L");
-        assert_eq!(args[l + 1], "7777:localhost:7777");
+        assert_eq!(args[l + 1], "7777:host.docker.internal:7777");
 
         // Target is the final argument.
         assert_eq!(args.last().unwrap(), "deploy@srv.example.com");
@@ -1553,6 +1580,23 @@ mod lifecycle_tests {
         };
         let args = build_ssh_args(&target(), Path::new("/k"), &fwd);
         assert!(args.contains(&"7778:localhost:8080".to_string()));
+    }
+
+    #[test]
+    fn forward_host_is_docker_host_only_for_dashboard() {
+        let dashboard = AllocatedForward {
+            container_id: DASHBOARD_CONTAINER_ID.to_string(),
+            remote_port: 7777,
+            local_port: 7777,
+        };
+        assert_eq!(dashboard.forward_host(), "host.docker.internal");
+
+        let container = AllocatedForward {
+            container_id: "web".to_string(),
+            remote_port: 8080,
+            local_port: 7778,
+        };
+        assert_eq!(container.forward_host(), "localhost");
     }
 
     // ---- status enum / probing -------------------------------------------
