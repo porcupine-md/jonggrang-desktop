@@ -1,0 +1,43 @@
+# Tauri v2 Rust backend for the Jonggrang Tunnel desktop app.
+#
+# Linux build prerequisites (NOT auto-installed — see README / docs task):
+#   sudo apt-get install -y \
+#     libwebkit2gtk-4.1-dev \
+#     libsoup-3.0-dev \
+#     build-essential \
+#     librsvg2-dev
+# Without these, `cargo tauri dev` / `cargo tauri build` fail to link on Linux.
+#
+# Everything here is pinned to Tauri v2 — do NOT mix v1 config keys/crates.
+
+[package]
+name = "jonggrang-tunnel"
+version = "0.1.0"
+description = "GUI for SSH tunneling into a jonggrang server"
+authors = ["Maia <codex@maia.id>"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# Tauri v2 lib/bin layout: the application logic lives in a library crate
+# (`run()` in src/lib.rs, also reusable as the mobile entry point) and the
+# binary (src/main.rs) is a thin shim that calls into it.
+[lib]
+name = "jonggrang_tunnel_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
