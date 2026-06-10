@@ -55,18 +55,27 @@ pub const DASHBOARD_FORWARD_HOST: &str = "host.docker.internal";
 /// `-L <local>:localhost:<remote>`.
 pub const DEFAULT_FORWARD_HOST: &str = "localhost";
 
-/// A parsed `<user>@<server>` SSH target.
+/// Default TCP port `ssh` connects to on the server. The jonggrang server runs
+/// `sshd` on `2222` (not the standard `22`); the user can override it per
+/// connection, but this is the out-of-the-box default.
+pub const DEFAULT_SSH_PORT: u16 = 2222;
+
+/// A parsed `<user>@<server>` SSH target plus the port `ssh` connects on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelTarget {
     /// The login user (left of the `@`).
     pub user: String,
     /// The server host (right of the `@`).
     pub host: String,
+    /// The SSH port to connect on. Defaults to [`DEFAULT_SSH_PORT`] (2222) when
+    /// the user does not override it.
+    pub port: u16,
 }
 
 impl TunnelTarget {
     /// Render the target back into the canonical `user@host` form that is
-    /// handed to `ssh` by the lifecycle manager.
+    /// handed to `ssh` by the lifecycle manager. The port is passed separately
+    /// via `-p` (see [`build_ssh_args`]), not folded into this string.
     pub fn ssh_target(&self) -> String {
         format!("{}@{}", self.user, self.host)
     }
@@ -228,6 +237,9 @@ pub fn parse_target(input: &str) -> Result<TunnelTarget, TunnelSpecError> {
     Ok(TunnelTarget {
         user: user.to_string(),
         host: host.to_string(),
+        // Default port; callers (e.g. `build_plan_from_spec`) override it when
+        // the user supplies one.
+        port: DEFAULT_SSH_PORT,
     })
 }
 
@@ -381,12 +393,19 @@ pub fn parse_forwards_optional(input: &str) -> Result<Vec<Forward>, TunnelSpecEr
 /// which receives both as raw strings from the webview. The forward spec is
 /// **optional** — an empty string yields a dashboard-only plan (just the
 /// always-present 7777 forward).
+///
+/// `port` overrides the SSH port; `None` keeps the [`DEFAULT_SSH_PORT`] (2222)
+/// that [`parse_target`] assigns.
 pub fn build_plan_from_spec(
     target: &str,
     forwards: &str,
+    port: Option<u16>,
     reserved: &HashSet<u16>,
 ) -> Result<TunnelPlan, TunnelSpecError> {
-    let target = parse_target(target)?;
+    let mut target = parse_target(target)?;
+    if let Some(port) = port {
+        target.port = port;
+    }
     let forwards = parse_forwards_optional(forwards)?;
     build_tunnel_plan(target, forwards, reserved)
 }
@@ -674,7 +693,7 @@ pub fn classify_ssh_log_line(line: &str) -> Option<SshLogSignal> {
 /// Build the full `ssh` argument vector (everything after the program name) for
 /// one forward, of the form:
 ///
-/// `-i <key> -N -v -o BatchMode=yes -o ExitOnForwardFailure=yes \
+/// `-i <key> -p <port> -N -v -o BatchMode=yes -o ExitOnForwardFailure=yes \
 ///  -o ServerAliveInterval=15 -L <local>:<forward-host>:<remote> <user>@<host>`
 ///
 /// The forward host is the dashboard's docker host for the dashboard forward and
@@ -688,6 +707,8 @@ pub fn build_ssh_args(target: &TunnelTarget, key_path: &Path, forward: &Allocate
     vec![
         "-i".to_string(),
         key_path.to_string_lossy().into_owned(),
+        "-p".to_string(),
+        target.port.to_string(),
         "-N".to_string(),
         "-v".to_string(),
         "-o".to_string(),
@@ -1051,6 +1072,9 @@ mod tests {
         assert_eq!(t.user, "deploy");
         assert_eq!(t.host, "example.com");
         assert_eq!(t.ssh_target(), "deploy@example.com");
+        // SSH port defaults to 2222 (the jonggrang server's sshd port).
+        assert_eq!(t.port, DEFAULT_SSH_PORT);
+        assert_eq!(t.port, 2222);
     }
 
     #[test]
@@ -1227,7 +1251,7 @@ mod tests {
     // ---- build_tunnel_plan -----------------------------------------------
 
     fn target() -> TunnelTarget {
-        TunnelTarget { user: "deploy".to_string(), host: "srv".to_string() }
+        TunnelTarget { user: "deploy".to_string(), host: "srv".to_string(), port: DEFAULT_SSH_PORT }
     }
 
     #[test]
@@ -1321,15 +1345,18 @@ mod tests {
     #[test]
     fn build_plan_from_spec_allows_dashboard_only() {
         // No `-c` forwards → a valid plan with just the dashboard forward.
-        let plan = build_plan_from_spec("deploy@srv", "", &in_use(&[])).unwrap();
+        let plan = build_plan_from_spec("deploy@srv", "", None, &in_use(&[])).unwrap();
         assert_eq!(plan.dashboard.local_port, 7777);
         assert!(plan.forwards.is_empty());
+        // No override → the default 2222 SSH port.
+        assert_eq!(plan.target.port, DEFAULT_SSH_PORT);
     }
 
     #[test]
     fn build_plan_from_spec_end_to_end() {
         let plan =
-            build_plan_from_spec("deploy@srv.example.com", "-c api:3000", &in_use(&[])).unwrap();
+            build_plan_from_spec("deploy@srv.example.com", "-c api:3000", None, &in_use(&[]))
+                .unwrap();
         assert_eq!(plan.target.ssh_target(), "deploy@srv.example.com");
         assert_eq!(plan.dashboard.local_port, 7777);
         assert_eq!(plan.forwards[0].container_id, "api");
@@ -1338,9 +1365,15 @@ mod tests {
     }
 
     #[test]
+    fn build_plan_from_spec_honors_port_override() {
+        let plan = build_plan_from_spec("deploy@srv", "", Some(2022), &in_use(&[])).unwrap();
+        assert_eq!(plan.target.port, 2022);
+    }
+
+    #[test]
     fn build_plan_from_spec_propagates_target_error() {
         assert_eq!(
-            build_plan_from_spec("bogus", "-c web:80", &in_use(&[])),
+            build_plan_from_spec("bogus", "-c web:80", None, &in_use(&[])),
             Err(TunnelSpecError::MalformedTarget("bogus".to_string()))
         );
     }
@@ -1370,6 +1403,7 @@ mod lifecycle_tests {
         TunnelTarget {
             user: "deploy".to_string(),
             host: "srv.example.com".to_string(),
+            port: DEFAULT_SSH_PORT,
         }
     }
 
@@ -1556,6 +1590,10 @@ mod lifecycle_tests {
         let i = args.iter().position(|a| a == "-i").expect("missing -i");
         assert_eq!(args[i + 1], "/h/.ssh/id_rsa");
 
+        // SSH port passed via -p, defaulting to 2222 for the jonggrang server.
+        let p = args.iter().position(|a| a == "-p").expect("missing -p");
+        assert_eq!(args[p + 1], "2222");
+
         assert!(args.contains(&"-N".to_string()), "must include -N (no remote command)");
         assert!(args.contains(&"-v".to_string()), "must include -v for status parsing");
         assert!(args.contains(&"BatchMode=yes".to_string()));
@@ -1691,7 +1729,7 @@ mod lifecycle_tests {
     }
 
     fn plan_with(forward_spec: &str) -> TunnelPlan {
-        build_plan_from_spec("deploy@srv.example.com", forward_spec, &HashSet::new()).unwrap()
+        build_plan_from_spec("deploy@srv.example.com", forward_spec, None, &HashSet::new()).unwrap()
     }
 
     #[test]

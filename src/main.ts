@@ -45,6 +45,8 @@ const TUNNEL_STATUS_EVENT = "tunnel-status";
 const STORAGE_KEY = "jonggrang.tunnel.config.v1";
 /** Container id the backend uses for the always-present dashboard forward. */
 const DASHBOARD_CONTAINER_ID = "dashboard";
+/** Default SSH port (the jonggrang server's sshd); mirrors the backend default. */
+const DEFAULT_SSH_PORT = 2222;
 /** Human-readable labels for the backend's lowercase status wire strings. */
 const STATUS_LABELS: Record<string, string> = {
   connecting: "Connecting…",
@@ -78,6 +80,7 @@ interface ContainerForward {
 
 interface TunnelConfig {
   target: string;
+  port: number;
   keyPath: string;
   projectId: string;
   forwards: ContainerForward[];
@@ -131,6 +134,10 @@ function readConfig(): TunnelConfig | null {
     }
     return {
       target: parsed.target,
+      port:
+        typeof parsed.port === "number" && Number.isInteger(parsed.port)
+          ? parsed.port
+          : DEFAULT_SSH_PORT,
       keyPath: typeof parsed.keyPath === "string" ? parsed.keyPath : "",
       projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
       forwards: parsed.forwards.filter(
@@ -236,11 +243,18 @@ function readSetupForm(): TunnelConfig {
   if (!/^[^@\s]+@[^@\s]+$/.test(target)) {
     throw new Error('Server target must look like "<user>@<server>".');
   }
+  // SSH port is optional in the form — a blank field falls back to 2222.
+  const portText = byId<HTMLInputElement>("port-input").value.trim();
+  const port = portText === "" ? DEFAULT_SSH_PORT : Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid SSH port: "${portText}" (expected 1-65535).`);
+  }
   // Container forwards are optional — with none, the backend still opens the
   // always-present dashboard forward (http://localhost:7777).
   const forwards = collectForwards();
   return {
     target,
+    port,
     keyPath: byId<HTMLInputElement>("key-input").value.trim(),
     projectId: byId<HTMLInputElement>("project-input").value.trim(),
     forwards,
@@ -249,6 +263,9 @@ function readSetupForm(): TunnelConfig {
 
 function populateSetupForm(config: TunnelConfig | null): void {
   byId<HTMLInputElement>("target-input").value = config?.target ?? "";
+  byId<HTMLInputElement>("port-input").value = String(
+    config?.port ?? DEFAULT_SSH_PORT,
+  );
   byId<HTMLInputElement>("key-input").value = config?.keyPath ?? "";
   byId<HTMLInputElement>("project-input").value = config?.projectId ?? "";
   byId("forward-rows").replaceChildren();
@@ -393,6 +410,7 @@ async function startTunnel(config: TunnelConfig): Promise<void> {
     const args: Record<string, unknown> = {
       target: config.target,
       forwards: buildForwardsSpec(config.forwards),
+      port: config.port,
     };
     if (config.keyPath) {
       args.keyPath = config.keyPath;
