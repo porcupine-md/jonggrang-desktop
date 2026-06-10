@@ -1,0 +1,165 @@
+{
+  "feature": "",
+  "branch": "",
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Phase 1a: Scaffold Node/TypeScript frontend toolchain",
+      "description": "Create the Node-side project skeleton for the Tauri v2 app. ACCEPTANCE CRITERIA: (1) package.json with name 'jonggrang-tunnel-desktop', private:true, type:module, scripts for 'dev' (tauri dev), 'build' (tsc && tauri build), and 'tauri'. (2) Dev dependency '@tauri-apps/cli' pinned to v2 (^2). (3) Runtime dependency '@tauri-apps/api' pinned to v2 (^2). (4) tsconfig.json targeting ES2020+, module ESNext, moduleResolution bundler, strict:true, include ['src']. (5) Update .gitignore to add node_modules/, dist/, target/, and src-tauri/target/. Follow AGENTS.md naming conventions (kebab-case.ts files). Do NOT scaffold the Rust side here (that is task-002). Versions must be pinned to avoid Tauri v1/v2 config drift.",
+      "priority": 1,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [],
+      "passes": false,
+      "files": [
+        "package.json",
+        "tsconfig.json",
+        ".gitignore"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-002",
+      "title": "Phase 1b: Scaffold Rust/Tauri v2 backend skeleton",
+      "description": "Create the src-tauri Rust backend skeleton for Tauri v2. ACCEPTANCE CRITERIA: (1) src-tauri/Cargo.toml with package metadata, [build-dependencies] tauri-build v2, [dependencies] tauri v2 (with features as needed), serde + serde_json (derive), and a lib/bin layout matching Tauri v2 conventions. (2) src-tauri/tauri.conf.json valid for Tauri v2 schema (productName, identifier like 'id.maia.jonggrang.tunnel', build.beforeDevCommand/beforeBuildCommand/devUrl/frontendDist pointing at the TS frontend, app.windows, bundle.targets including deb/appimage for Linux and dmg/app for macOS). (3) src-tauri/build.rs invoking tauri_build::build(). (4) src-tauri/src/main.rs that boots a Tauri builder, prevents console window, and will register commands (stub invoke_handler ok for now; real commands wired in task-005). (5) src-tauri/icons/ with at least the required icon set referenced by tauri.conf.json (placeholder PNG/ico/icns acceptable). Document the missing Linux build deps (libwebkit2gtk-4.1-dev, libsoup-3.0-dev, build-essential, librsvg2-dev) as a code comment or note for the docs task. Pin Tauri v2 everywhere; do not mix v1 config keys.",
+      "priority": 2,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-001"
+      ],
+      "passes": false,
+      "files": [
+        "src-tauri/Cargo.toml",
+        "src-tauri/tauri.conf.json",
+        "src-tauri/build.rs",
+        "src-tauri/src/main.rs",
+        "src-tauri/icons/icon.png"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-003",
+      "title": "Phase 2: Tunnel spec parsing & local-port allocation (pure logic + tests)",
+      "description": "Implement pure, testable Rust logic for parsing tunnel specs and allocating local ports. Put this in src-tauri/src/tunnel.rs (module skeleton; lifecycle added in task-004) or a dedicated submodule. ACCEPTANCE CRITERIA: (1) Parse a '<user>@<server>' target into a typed struct (user, host), returning a typed error on malformed input. (2) Parse a forward list of the form '-c <cid>:port,<cid2>:port' into a typed Vec of forward entries (container id + remote port). (3) Build a typed 'tunnel plan' that assigns each forward a DISTINCT local port; the dashboard forward defaults to local port 7777 (define DASHBOARD_LOCAL_PORT and DASHBOARD_REMOTE_PORT=7777 as UPPER_SNAKE_CASE constants). (4) Port allocation must detect collisions and pick the next free local port (pure allocation against a provided 'in-use' set; OS-level probing belongs to lifecycle). (5) Functions named camelCase-equivalent Rust snake_case; types PascalCase. (6) Comprehensive #[cfg(test)] unit tests covering: valid/invalid targets, single & multiple forwards, default dashboard port, and collision avoidance. 'cargo test' must pass in src-tauri without any live SSH. Keep all functions pure (no process spawning, no network).",
+      "priority": 3,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-002"
+      ],
+      "passes": false,
+      "files": [
+        "src-tauri/src/tunnel.rs"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-004",
+      "title": "Phase 3: SSH tunnel lifecycle manager (spawn/track/health/teardown)",
+      "description": "Extend src-tauri/src/tunnel.rs with a stateful SSH child-process lifecycle manager built on the pure plan from task-003. ACCEPTANCE CRITERIA: (1) A TunnelManager (Send+Sync, e.g. behind Mutex) that spawns 'ssh -L <local>:localhost:<remote> -N -v <user>@<server>' children via std::process::Command, one per forward (or a single multi -L invocation), tracking child PIDs/handles. (2) Connection-state inference: parse ssh stderr (-v output) AND actively probe the local port (TcpStream connect) to derive a status enum (Connecting/Connected/Failed/Stopped). (3) Health query exposing each forward's current status and local URL. (4) Guaranteed teardown: stop() kills tracked children and reaps them; also register teardown on app exit so no ssh child leaks on stop/crash/quit. (5) SSH key resolution honoring jonggrang precedence: '~/.jonggrang/web/ssh/<id>.key' -> '~/.jonggrang/web/ssh/global.key' -> '~/.ssh/id_rsa', modeling the logic in .jonggrang/lib/sandbox.js (REFERENCE ONLY, do not modify it). Pass ONLY the key path to ssh via '-i'; never read key contents into memory. Surface the 0600/owner permission gotcha as a clear error message. Add unit tests for key-resolution precedence and status-parsing helpers where they can be made pure. Do NOT require a live SSH server for the test suite to pass.",
+      "priority": 4,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-003"
+      ],
+      "passes": false,
+      "files": [
+        "src-tauri/src/tunnel.rs"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-005",
+      "title": "Phase 4: Tauri commands bridge + live state events",
+      "description": "Create src-tauri/src/commands.rs exposing the lifecycle manager to the webview and wire it into main.rs. ACCEPTANCE CRITERIA: (1) #[tauri::command] handlers: start_tunnel (accepts target + forward spec, builds plan via task-003 logic, starts via TunnelManager), stop_tunnel, tunnel_status (returns current state of all forwards incl. local URLs), and list_forwards. (2) Commands take tauri::State holding the shared TunnelManager. (3) Emit live state-change events to the frontend (e.g. app.emit('tunnel-status', payload)) so the UI updates without polling; payload serde-serializable. (4) main.rs registers all commands in invoke_handler!/generate_handler! and manages the TunnelManager state, plus registers the on-exit teardown hook from task-004. (5) All command inputs/outputs use serde structs (serde Serialize/Deserialize). Return typed, user-readable errors (Result<_, String> or a serializable error) — including the SSH key permission gotcha. Ensure 'cargo test' and 'cargo build' still succeed.",
+      "priority": 5,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-004"
+      ],
+      "passes": false,
+      "files": [
+        "src-tauri/src/commands.rs",
+        "src-tauri/src/main.rs"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-006",
+      "title": "Phase 5: Dashboard webview UI (setup form + live status)",
+      "description": "Build the TypeScript webview frontend in src/. ACCEPTANCE CRITERIA: (1) src/index.html as the Tauri frontend entry referenced by tauri.conf.json (frontendDist/devUrl), loading the compiled main.ts. (2) src/main.ts implementing: a FIRST-LAUNCH SETUP FORM capturing server target (<user>@<server>), an SSH key picker (path input or @tauri-apps/api dialog; never read key contents), and the container forward list (-c <cid>:port entries). (3) A LIVE STATUS VIEW listing each forward with its inferred connection state and its local URL — the dashboard forward shows http://localhost:7777 — plus per-tunnel and global Start/Stop controls. (4) Use @tauri-apps/api invoke() to call start_tunnel/stop_tunnel/tunnel_status/list_forwards and listen() for the 'tunnel-status' events from task-005 to update the UI live. (5) Surface backend errors (esp. the SSH key 0600/owner gotcha) in the UI. Follow AGENTS.md naming conventions: files kebab-case.ts, functions camelCase, constants UPPER_SNAKE_CASE; if a component framework is used, components PascalCase.tsx. No backend logic in the frontend — it only drives the Rust commands.",
+      "priority": 6,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-005"
+      ],
+      "passes": false,
+      "files": [
+        "src/index.html",
+        "src/main.ts"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-007",
+      "title": "Phase 6: GitHub Actions build workflow for macOS + Linux binaries",
+      "description": "Add .github/workflows/build.yml producing both macOS and Linux binaries via a matrix. ACCEPTANCE CRITERIA: (1) Triggers: push and pull_request on the feature branch 'feat/jonggrang-tunnel-desktop', plus version tag pushes (e.g. 'v*'). (2) A strategy matrix over [macos-latest, ubuntu-latest]. (3) Common steps on both legs: actions/checkout (pinned), actions/setup-node (pinned, Node 20+), a Rust toolchain action (pinned), cargo + npm caching, 'npm ci', and 'cargo test' (run in src-tauri) — CI must run cargo test on BOTH legs. (4) Ubuntu leg first apt-get installs the Linux build deps: libwebkit2gtk-4.1-dev, libsoup-3.0-dev, build-essential, librsvg2-dev. (5) Build release bundles via tauri-apps/tauri-action (pinned): .dmg/.app on macOS, .deb/.AppImage on Linux. (6) Upload bundles with actions/upload-artifact (pinned) on every build, AND attach them to a GitHub Release on tag pushes. (7) Pin ALL action versions to avoid CI drift; note in comments that macOS cannot be cross-compiled from Linux, hence the macos-latest leg. This workflow is the canonical way to obtain both platform binaries.",
+      "priority": 7,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-006"
+      ],
+      "passes": false,
+      "files": [
+        ".github/workflows/build.yml"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    },
+    {
+      "id": "task-008",
+      "title": "Phase 7: Docs & conventions (AGENTS.md, README.md)",
+      "description": "Fill in project documentation and record key decisions. ACCEPTANCE CRITERIA: (1) AGENTS.md: complete the stack/structure/setup/architecture TODO sections — document the Tauri v2 + TS + Rust stack, the src/ + src-tauri/ structure, the manual Linux build-dep setup prerequisite (libwebkit2gtk-4.1-dev, libsoup-3.0-dev, build-essential, librsvg2-dev), and the architecture (webview UI -> Tauri commands -> TunnelManager shelling out to system ssh -L). Keep/confirm naming conventions: kebab-case.ts, PascalCase.tsx, camelCase functions, UPPER_SNAKE_CASE constants. (2) README.md: rewrite with project overview, usage (first-launch setup, forwards, dashboard at http://localhost:7777), local build instructions incl. installing the missing Linux deps and 'cargo tauri'/@tauri-apps/cli, and crucially HOW TO DOWNLOAD the CI-built macOS/Linux binaries from the GitHub Actions artifacts and Releases (from task-007). (3) Record the key architectural decisions (shell-out to system ssh, key-resolution precedence, port strategy, CI-only macOS builds, secret-safety: only key paths passed to ssh). Reflect the actual implemented behavior, not just the plan.",
+      "priority": 8,
+      "status": "pending",
+      "feature_id": "jonggrang-tunnel-desktop-mq7tilp6",
+      "skill": null,
+      "blocked_by": [
+        "task-007"
+      ],
+      "passes": false,
+      "files": [
+        "AGENTS.md",
+        "README.md"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "error_log": []
+    }
+  ]
+}
