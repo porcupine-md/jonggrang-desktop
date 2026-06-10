@@ -8,10 +8,15 @@
 
 ## Project Overview
 
-- **Name**: Jonggrang-desktop
-- **Type**: api
-- **Stack**: node-typescript
-- **Description**: TODO - describe what this project does
+- **Name**: Jonggrang-desktop (`jonggrang-tunnel-desktop`)
+- **Type**: Tauri v2 desktop application (macOS + Linux)
+- **Stack**: Tauri v2 — TypeScript webview frontend + Rust backend
+- **Description**: A GUI front-end for SSH local-port forwarding into a jonggrang
+  server. The app owns the forwarding logic by shelling out to the host's
+  system `ssh -L <local>:localhost:<remote> user@server`, reusing the user's
+  existing keys / agent / `known_hosts` and keeping private keys out of app
+  memory. A dashboard webview handles first-launch setup and live tunnel status;
+  the dashboard forward defaults to `http://localhost:7777`.
 
 ---
 
@@ -19,16 +24,32 @@
 
 ### File Structure
 ```
-TODO - document your project's file structure pattern
-Example:
-src/
-├── routes/       # API route handlers
-├── services/     # Business logic
-├── models/       # Database models/schemas
-├── middleware/    # Express/framework middleware
-├── utils/        # Shared utilities
-└── types/        # TypeScript type definitions
+src/                     # TypeScript webview frontend (static, NO bundler)
+├── index.html           # Dashboard markup (served as Tauri frontendDist)
+├── main.ts              # UI logic — calls Tauri commands via window.__TAURI__
+└── main.js              # tsc emit of main.ts (build artifact; gitignored)
+
+src-tauri/               # Rust backend (Cargo crate)
+├── Cargo.toml           # crate = jonggrang_tunnel_lib (lib + bin split)
+├── build.rs             # Tauri codegen build script
+├── tauri.conf.json      # Tauri v2 config (frontendDist=../src, withGlobalTauri)
+├── icons/               # App icons (.png/.ico/.icns)
+└── src/
+    ├── main.rs          # Thin bin shim → jonggrang_tunnel_lib::run()
+    ├── lib.rs           # run(): Tauri builder + invoke_handler + exit hook
+    ├── tunnel.rs        # PURE spec parsing/port alloc + TunnelManager lifecycle
+    └── commands.rs      # #[tauri::command] bridge + serde DTOs + status events
+
+.github/workflows/
+└── build.yml            # mac+linux release build matrix (CI)
 ```
+
+Notes:
+- The frontend is a **static** dir (no Vite/dev server). `tauri.conf.json` sets
+  `build.frontendDist = "../src"`, and `app.withGlobalTauri = true` so the
+  webview reaches Tauri via `window.__TAURI__` instead of bare ESM imports.
+- `tunnel.rs` is kept **std-only / serde-free** so it is unit-testable in
+  isolation; serde DTOs and the Tauri boundary live in `commands.rs`.
 
 ### Naming Conventions
 - Files: `kebab-case.ts`
@@ -39,57 +60,132 @@ src/
 - API endpoints: `kebab-case`
 
 ### Code Patterns
-- TODO - document patterns used in this project
-- Example: "All route handlers follow: validate input -> call service -> format response"
-- Example: "Use Zod for all runtime validation"
-- Example: "Error responses always use format: { error: string, code: string }"
+- **Layering**: webview UI → `#[tauri::command]` (commands.rs) → `TunnelManager`
+  (tunnel.rs) → spawned system `ssh -L` child processes. Each layer only talks to
+  its neighbour.
+- **Pure core, impure edge**: tunnel-spec parsing and local-port allocation are
+  pure functions (no spawn, no net, no OS probe) in `tunnel.rs`. Keep them that
+  way — it is what makes `cargo test` meaningful without a live SSH server.
+- **Serde at the boundary only**: `tunnel.rs` stays std-only. DTOs
+  (`StartTunnelArgs`, `TunnelStatus`, `ForwardView`) live in `commands.rs` with
+  `#[serde(rename_all = "camelCase")]`; convert via `impl From<…>` at the edge.
+- **One ssh child per forward** (not a single multi-`-L`) so each forward has
+  independent status and teardown.
+- **Teardown is RAII**: `impl Drop for ForwardProcess` kills + reaps the child;
+  `TunnelManager::stop()` just clears the vec. `lib.rs` also calls `stop()` on
+  Tauri `RunEvent::Exit` as the explicit hook; Drop is the backstop.
+- **Status is inferred** (not reported): combine ssh `-v` stderr parsing with an
+  active loopback port probe, reconciled strongest-first.
+- **Events over polling**: every state change emits a `tunnel-status` event; the
+  same `TunnelStatus` is both the command return value and the event payload.
+- **Frontend**: type-only imports (`import type { … }`) so `tsc` erases them and
+  the emitted `main.js` has zero bare ESM specifiers; runtime goes through
+  `window.__TAURI__`.
 
 ### Testing Conventions
-- Framework: none
-- Command: echo 'no test command configured'
-- Pattern: TODO - describe your test patterns
-- Example: "Integration tests use a real test database, not mocks"
-- Example: "Each test file has its own setup/teardown"
+- Framework: Rust built-in `#[test]` (no JS test framework configured).
+- Command: `cd src-tauri && cargo test` (runs in CI on both matrix legs).
+- Pattern: pure functions are tested directly; FS/OS interactions are tested via
+  injected predicates (e.g. `resolve_ssh_key_with(cands, exists_fn)`) so key
+  precedence is covered without touching the filesystem.
+- **Local gotcha**: full `cargo test` needs the Linux WebKit build deps (see
+  Development Setup). Without them, validate a pure module standalone:
+  `cd src-tauri && rustc --test --edition 2021 src/tunnel.rs -o /tmp/t && /tmp/t`.
 
 ---
 
 ## Known Gotchas
 
-- TODO - document things that are surprising or non-obvious
-- Example: "Prisma unique constraint errors throw P2002, need explicit handling"
-- Example: "Test database needs cleanup between runs — use beforeEach, not beforeAll"
-- Example: "The auth middleware reads from both cookie and Authorization header"
+- **Linux build-dep wall**: `cargo build`/`tauri build`/full `cargo test` fail
+  locally until `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`, `build-essential`,
+  `librsvg2-dev` are installed (tauri/wry link the WebKit/GTK stack; libdbus is
+  hit first). CI installs these; on a dev box it is a manual (sudo) prerequisite.
+- **No bundler → no bare imports**: the webview cannot resolve
+  `@tauri-apps/api/core` at runtime (node_modules is not in `frontendDist`). Use
+  `window.__TAURI__` (enabled by `withGlobalTauri`) for runtime, `import type`
+  for types only.
+- **`tsc` must emit**: `tsconfig` has `noEmit: false` because
+  `beforeBuildCommand: "tsc"` both typechecks AND emits `src/main.js` into the
+  served dir. `src/*.js` is gitignored (build artifact — never commit it).
+- **`-c` flag stripping**: strip a leading `-c` only when it stands alone, NEVER
+  when it prefixes a container id like `cache:80` / `-cache:80`.
+- **SSH key `0600`/owner**: surfaces twice — a pre-flight `BadPermissions` error
+  (with a `chmod 600` hint) and a runtime stderr signal ("bad owner or
+  permissions"). The frontend shows the backend's `Err` string verbatim.
+- **Only the key PATH is passed to ssh** (`-i <path>`); key contents are never
+  read into app memory.
+- **App SIGKILL can still leak ssh children** — RAII Drop and the exit hook cover
+  stop/normal-exit/panic-unwind, but a hard kill bypasses both.
+- **Per-forward Start/Stop is global only**: the backend exposes global
+  `start_tunnel`/`stop_tunnel`; per-forward cards expose Open/Copy only. A future
+  `stop_forward` command would be needed for per-forward control.
 
 ---
 
 ## Architecture Decisions
 
-- TODO - document why things are the way they are
-- Example: "We use JWT instead of sessions because the API serves mobile + web"
-- Example: "Chose Drizzle over Prisma for better type inference and SQL control"
-- Example: "Monorepo with turborepo because shared types between API and web"
+- **Shell out to system `ssh -L`** rather than a native Rust SSH crate (`russh`).
+  Reuses the user's keys / agent / `known_hosts`, keeps secrets out of process
+  memory, and matches jonggrang's own key-resolution model. The tradeoff —
+  inferred connection state and child-process lifecycle management — is accepted.
+- **Key-resolution precedence**: `~/.jonggrang/web/ssh/<id>.key` →
+  `~/.jonggrang/web/ssh/global.key` → `~/.ssh/id_rsa`, modeling
+  `.jonggrang/lib/sandbox.js`. An explicit `keyPath` from the UI overrides this.
+- **Port strategy**: the dashboard forward is allocated FIRST and keeps the
+  canonical local `7777` (bumping up only on collision); each `-c` forward fans
+  out from `7778` via monotonic next-free-port scanning against a reserved set.
+- **CI-only macOS builds**: Tauri cannot cross-compile a macOS `.app`/`.dmg` from
+  Linux (needs the Apple SDK + codesign on a macOS host), so a
+  `macos-latest` + `ubuntu-latest` GitHub Actions matrix is the canonical way to
+  produce both platform binaries. The local Linux box builds Linux bundles only.
+- **Secret safety**: only the key PATH is passed to ssh (`-i`); key contents are
+  never read into the app or agent context.
+- **Tauri v2 lib/bin split**: `lib.rs::run()` owns the builder + invoke_handler +
+  exit hook; `main.rs` is a thin shim. Tauri pinned to `^2` / `@tauri-apps/api`
+  `^2` to avoid v1/v2 config drift.
 
 ---
 
 ## Dependencies & Integrations
 
-- TODO - document external service integrations
-- Example: "Email via SendGrid — API key in SENDGRID_API_KEY env var"
-- Example: "File uploads go to S3 bucket defined in AWS_S3_BUCKET"
-- Example: "Auth tokens are RS256 signed — public key at /api/auth/.well-known/jwks.json"
+- **System `ssh`** (OpenSSH): spawned as `ssh -i <key> -N -v -o BatchMode=yes -o
+  ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L <local>:localhost:<remote>
+  user@host`. Must be on `PATH`. No SSH library dependency.
+- **SSH keys**: resolved from `~/.jonggrang/web/ssh/` then `~/.ssh/id_rsa` (see
+  Architecture Decisions). Only the path is used; contents are never read.
+- **Tauri v2** (`@tauri-apps/api` ^2 runtime, `@tauri-apps/cli` ^2 dev,
+  `typescript` ^5). The webview integrates via `window.__TAURI__`.
+- **GitHub Actions** (`tauri-apps/tauri-action`, `actions/checkout`,
+  `actions/setup-node`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`,
+  `actions/upload-artifact`) — produces and publishes the mac/linux binaries.
 
 ---
 
 ## Development Setup
 
 ```bash
-# TODO - document how to run the project locally
-# Example:
-# cp .env.example .env
-# docker-compose up -d    # Start database
-# npm install
-# npm run db:migrate       # Run migrations
-# npm run dev              # Start dev server
+# 1. Install the Linux build deps (one-time, sudo) — NOT auto-installed.
+#    These satisfy the WebKit/GTK stack tauri/wry link against.
+sudo apt-get update
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential librsvg2-dev
+
+# 2. Install the Tauri CLI. It ships as the @tauri-apps/cli dev dependency
+#    (invoked via `npm run tauri`), or install the Rust CLI globally:
+#    cargo install tauri-cli   # gives `cargo tauri`
+
+# 3. Frontend + Rust deps.
+npm install
+
+# 4. Run in dev (typechecks + serves src/ + builds the Rust backend).
+npm run dev            # = tauri dev
+
+# 5. Build release bundles (Linux: .deb/.AppImage). macOS bundles only build
+#    on a macOS host — use the CI workflow for those (see README).
+npm run build          # = tsc && tauri build
+
+# Run Rust tests:
+cd src-tauri && cargo test
 ```
 
 ---
