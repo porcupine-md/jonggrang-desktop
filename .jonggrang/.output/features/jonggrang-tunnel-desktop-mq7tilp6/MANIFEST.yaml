@@ -1,0 +1,160 @@
+feature_id: jonggrang-tunnel-desktop-mq7tilp6
+description: jonggrang-tunnel-desktop
+work_type: LARGE
+created_at: '2026-06-10T08:41:26.923Z'
+updated_at: '2026-06-10T09:45:17.025Z'
+status: completed
+current_phase: null
+active_phases:
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+phases:
+  '1':
+    name: setup
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.935Z'
+    agent_id: null
+    output:
+      source: approve
+  '2':
+    name: triage
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.938Z'
+    agent_id: null
+    output:
+      source: approve
+  '3':
+    name: codebase-discovery
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.940Z'
+    agent_id: null
+    output:
+      source: approve
+  '4':
+    name: skill-discovery
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.942Z'
+    agent_id: null
+    output:
+      source: approve
+  '5':
+    name: complexity
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.943Z'
+    agent_id: null
+    output:
+      source: approve
+  '6':
+    name: brainstorming
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.945Z'
+    agent_id: null
+    output:
+      source: approve
+  '7':
+    name: architecting
+    status: completed
+    started_at: null
+    completed_at: '2026-06-10T08:41:26.947Z'
+    agent_id: null
+    output:
+      source: approve
+  '8':
+    name: implementation
+    status: completed
+    started_at: '2026-06-10T08:42:33.886Z'
+    completed_at: '2026-06-10T09:22:01.600Z'
+    agent_id: null
+    output:
+      source: work-loop
+  '9':
+    name: simplification
+    status: completed
+    started_at: '2026-06-10T09:22:01.629Z'
+    completed_at: '2026-06-10T09:22:27.352Z'
+    agent_id: null
+    output: null
+  '10':
+    name: design-verification
+    status: completed
+    started_at: '2026-06-10T09:22:27.355Z'
+    completed_at: '2026-06-10T09:24:28.645Z'
+    agent_id: null
+    output: null
+  '11':
+    name: domain-compliance
+    status: completed
+    started_at: '2026-06-10T09:24:28.648Z'
+    completed_at: '2026-06-10T09:25:59.118Z'
+    agent_id: null
+    output: null
+  '12':
+    name: code-quality
+    status: completed
+    started_at: '2026-06-10T09:25:59.121Z'
+    completed_at: '2026-06-10T09:29:01.212Z'
+    agent_id: null
+    output: null
+  '13':
+    name: test-planning
+    status: completed
+    started_at: '2026-06-10T09:29:01.215Z'
+    completed_at: '2026-06-10T09:31:15.391Z'
+    agent_id: null
+    output: null
+  '14':
+    name: testing
+    status: completed
+    started_at: '2026-06-10T09:31:15.394Z'
+    completed_at: '2026-06-10T09:37:18.278Z'
+    agent_id: null
+    output: null
+  '15':
+    name: coverage
+    status: completed
+    started_at: '2026-06-10T09:37:18.280Z'
+    completed_at: '2026-06-10T09:41:15.418Z'
+    agent_id: null
+    output: null
+  '16':
+    name: test-quality
+    status: completed
+    started_at: '2026-06-10T09:41:15.420Z'
+    completed_at: '2026-06-10T09:42:58.710Z'
+    agent_id: null
+    output: null
+  '17':
+    name: completion
+    status: completed
+    started_at: '2026-06-10T09:42:58.712Z'
+    completed_at: '2026-06-10T09:45:17.025Z'
+    agent_id: null
+    output: null
+agents: {}
+validation:
+  review_passed: false
+  tests_passed: false
+  coverage_met: false
+locks: []
+context_usage: null
