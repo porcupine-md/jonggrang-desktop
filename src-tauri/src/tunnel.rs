@@ -814,8 +814,23 @@ fn spawn_forward(
     forward: &AllocatedForward,
 ) -> std::io::Result<ForwardProcess> {
     let args = build_ssh_args(target, key_path, forward);
-    let mut child = Command::new("ssh")
-        .args(&args)
+    let mut command = Command::new("ssh");
+    command.args(&args);
+    spawn_forward_process(command, forward.clone())
+}
+
+/// Spawn `command` as a forward child — wiring stdio (null stdin/stdout, piped
+/// stderr) and the `-v` stderr status reader — and wrap it in a
+/// [`ForwardProcess`] bound to `forward`.
+///
+/// Factoring the raw spawn out of [`spawn_forward`] (which fixes the program to
+/// `ssh`) gives the lifecycle tests a seam to inject a stand-in child program
+/// and exercise the spawn→track→reap state machine without a live SSH server.
+fn spawn_forward_process(
+    mut command: Command,
+    forward: AllocatedForward,
+) -> std::io::Result<ForwardProcess> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -827,7 +842,7 @@ fn spawn_forward(
         .take()
         .map(|err| spawn_status_reader(err, Arc::clone(&status)));
     Ok(ForwardProcess {
-        forward: forward.clone(),
+        forward,
         pid,
         child,
         status,
@@ -907,6 +922,23 @@ impl TunnelManager {
     /// this call are reaped (via their `Drop`) before the error is returned, so a
     /// failed start never leaks a partial set of children.
     pub fn start(&mut self, plan: &TunnelPlan, key_path: &Path) -> Result<(), TunnelError> {
+        self.start_with(plan, key_path, spawn_forward)
+    }
+
+    /// The spawn machinery behind [`TunnelManager::start`], parameterized by the
+    /// per-forward spawn function so tests can inject a stand-in child program.
+    /// The production path passes [`spawn_forward`] (real `ssh`); the contract is
+    /// identical either way — validate the key, tear down any previous children,
+    /// then spawn one child per forward, never leaking a partial set on failure.
+    fn start_with<F>(
+        &mut self,
+        plan: &TunnelPlan,
+        key_path: &Path,
+        spawn: F,
+    ) -> Result<(), TunnelError>
+    where
+        F: Fn(&TunnelTarget, &Path, &AllocatedForward) -> std::io::Result<ForwardProcess>,
+    {
         check_key_permissions(key_path)?;
         // Tear down anything from a previous start first.
         self.stop();
@@ -915,8 +947,7 @@ impl TunnelManager {
         // partial set without ever touching `self.forwards`.
         let mut spawned = Vec::new();
         for forward in plan.all_forwards() {
-            let process = spawn_forward(&plan.target, key_path, forward)
-                .map_err(TunnelError::Spawn)?;
+            let process = spawn(&plan.target, key_path, forward).map_err(TunnelError::Spawn)?;
             spawned.push(process);
         }
         self.forwards = spawned;
@@ -1522,5 +1553,136 @@ mod lifecycle_tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TunnelManager>();
         assert_send_sync::<SharedTunnelManager>();
+    }
+
+    // ---- probe against a real loopback socket (P1) -----------------------
+
+    #[test]
+    fn probe_bound_port_is_true() {
+        // A live loopback listener must be reported reachable — the positive
+        // counterpart to `probe_unbound_port_is_false`, exercising the active
+        // half of status inference with no SSH server. (The negative direction
+        // is covered deterministically by `probe_unbound_port_is_false`; pairing
+        // it here would race on lingering kernel state from this probe's connect.)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_local_port(port), "a bound loopback port must probe true");
+    }
+
+    // ---- TunnelManager lifecycle via injected stand-in child (P2/P3) -----
+
+    /// Create a real `0600` key file so `start_with`'s permission pre-flight
+    /// passes. The path is only stat'd, never spawned against — the tests below
+    /// inject a stand-in program in place of `ssh`.
+    fn temp_key_0600(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir()
+            .join(format!("jonggrang-test-key-{}-{}", std::process::id(), tag));
+        std::fs::write(&path, b"not-a-real-key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    /// A stand-in spawn fn that runs a long-lived `sleep` (ignores its args,
+    /// binds no port) in place of `ssh`, giving the manager real PIDs to track.
+    fn spawn_sleeper(
+        _t: &TunnelTarget,
+        _k: &Path,
+        fwd: &AllocatedForward,
+    ) -> std::io::Result<ForwardProcess> {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        spawn_forward_process(cmd, fwd.clone())
+    }
+
+    fn plan_with(forward_spec: &str) -> TunnelPlan {
+        build_plan_from_spec("deploy@srv.example.com", forward_spec, &HashSet::new()).unwrap()
+    }
+
+    #[test]
+    fn start_tracks_one_child_per_forward_and_stop_reaps_all() {
+        // dashboard + 2 container forwards = 3 children.
+        let plan = plan_with("-c web:8080,db:5432");
+        let key = temp_key_0600("track");
+        let mut mgr = TunnelManager::new();
+
+        mgr.start_with(&plan, &key, spawn_sleeper).unwrap();
+        assert!(mgr.is_running());
+
+        let health = mgr.health();
+        assert_eq!(health.len(), 3, "one tracked child per forward");
+        assert!(health.iter().all(|h| h.pid.is_some()), "every forward has a live pid");
+        // A long-lived sleeper binds no port and emits no `-v` signal → the
+        // status stays Connecting (never spuriously Connected).
+        assert!(health.iter().all(|h| h.status == ForwardStatus::Connecting));
+
+        mgr.stop();
+        assert!(!mgr.is_running(), "stop drains every tracked child");
+        assert!(mgr.health().is_empty());
+
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn failed_spawn_never_leaks_a_partial_set() {
+        // The dashboard child spawns fine; the next forward's program does not
+        // exist, so its spawn() errors → start must surface Spawn and leave
+        // `forwards` empty (the already-spawned dashboard child is dropped and
+        // reaped, never retained as a partial set).
+        let plan = plan_with("-c web:8080");
+        let key = temp_key_0600("partial");
+        let mut mgr = TunnelManager::new();
+
+        let result = mgr.start_with(&plan, &key, |_t, _k, fwd: &AllocatedForward| {
+            if fwd.container_id == DASHBOARD_CONTAINER_ID {
+                let mut cmd = Command::new("sleep");
+                cmd.arg("30");
+                spawn_forward_process(cmd, fwd.clone())
+            } else {
+                spawn_forward_process(
+                    Command::new("/nonexistent/jonggrang-fake-ssh-bin"),
+                    fwd.clone(),
+                )
+            }
+        });
+
+        assert!(matches!(result, Err(TunnelError::Spawn(_))));
+        assert!(!mgr.is_running(), "a failed start must not retain a partial set");
+        assert!(mgr.health().is_empty());
+
+        // The manager remains usable: a clean start afterwards works.
+        mgr.start_with(&plan, &key, spawn_sleeper).unwrap();
+        assert!(mgr.is_running());
+        mgr.stop();
+
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn current_status_reports_failed_when_child_exits_nonzero() {
+        // `false` exits non-zero immediately; current_status must reconcile the
+        // child's exit (via try_wait) to Failed, overriding the initial
+        // Connecting. Polled with a bound so a regression cannot hang the suite.
+        let plan = plan_with("-c web:8080");
+        let key = temp_key_0600("failed");
+        let mut mgr = TunnelManager::new();
+
+        mgr.start_with(&plan, &key, |_t, _k, fwd: &AllocatedForward| {
+            spawn_forward_process(Command::new("false"), fwd.clone())
+        })
+        .unwrap();
+
+        let mut all_failed = false;
+        for _ in 0..200 {
+            if mgr.health().iter().all(|h| h.status == ForwardStatus::Failed) {
+                all_failed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(all_failed, "exited-nonzero children must reconcile to Failed");
+
+        mgr.stop();
+        let _ = std::fs::remove_file(&key);
     }
 }
