@@ -334,16 +334,37 @@ pub fn build_tunnel_plan(
     })
 }
 
+/// Like [`parse_forwards`] but treats an empty (or bare `-c`) spec as "no
+/// container forwards" instead of an error, so a **dashboard-only** tunnel is
+/// valid. Any non-empty spec is delegated to [`parse_forwards`], so malformed
+/// entries still surface their precise [`TunnelSpecError`].
+pub fn parse_forwards_optional(input: &str) -> Result<Vec<Forward>, TunnelSpecError> {
+    let mut spec = input.trim();
+    // Mirror `parse_forwards`' optional leading `-c` handling before deciding
+    // whether the spec is genuinely empty.
+    if let Some(rest) = spec.strip_prefix("-c") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            spec = rest.trim();
+        }
+    }
+    if spec.is_empty() {
+        return Ok(Vec::new());
+    }
+    parse_forwards(input)
+}
+
 /// Convenience: parse a `<user>@<host>` target string and a `-c ...` forward
 /// string and build a plan in one call. Useful for the Tauri command bridge,
-/// which receives both as raw strings from the webview.
+/// which receives both as raw strings from the webview. The forward spec is
+/// **optional** — an empty string yields a dashboard-only plan (just the
+/// always-present 7777 forward).
 pub fn build_plan_from_spec(
     target: &str,
     forwards: &str,
     reserved: &HashSet<u16>,
 ) -> Result<TunnelPlan, TunnelSpecError> {
     let target = parse_target(target)?;
-    let forwards = parse_forwards(forwards)?;
+    let forwards = parse_forwards_optional(forwards)?;
     build_tunnel_plan(target, forwards, reserved)
 }
 
@@ -1247,6 +1268,36 @@ mod tests {
         for p in &locals {
             assert!(!reserved.contains(p), "allocated port {} collided with reserved", p);
         }
+    }
+
+    #[test]
+    fn parse_forwards_optional_treats_empty_as_no_forwards() {
+        // Empty / whitespace / bare `-c` are all valid dashboard-only specs.
+        assert_eq!(parse_forwards_optional(""), Ok(vec![]));
+        assert_eq!(parse_forwards_optional("   "), Ok(vec![]));
+        assert_eq!(parse_forwards_optional("-c"), Ok(vec![]));
+        assert_eq!(parse_forwards_optional("-c   "), Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_forwards_optional_still_parses_and_validates_entries() {
+        let f = parse_forwards_optional("-c web:8080").unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].container_id, "web");
+        assert_eq!(f[0].remote_port, 8080);
+        // A genuinely malformed entry must still error, not be swallowed.
+        assert_eq!(
+            parse_forwards_optional("web:notaport"),
+            Err(TunnelSpecError::InvalidPort("notaport".to_string()))
+        );
+    }
+
+    #[test]
+    fn build_plan_from_spec_allows_dashboard_only() {
+        // No `-c` forwards → a valid plan with just the dashboard forward.
+        let plan = build_plan_from_spec("deploy@srv", "", &in_use(&[])).unwrap();
+        assert_eq!(plan.dashboard.local_port, 7777);
+        assert!(plan.forwards.is_empty());
     }
 
     #[test]

@@ -22,11 +22,15 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::tunnel::{
     build_plan_from_spec, resolve_default_ssh_key, ForwardHealth, SharedTunnelManager,
+    DASHBOARD_CONTAINER_ID, DASHBOARD_LOCAL_PORT,
 };
+
+/// Window label for the in-app dashboard webview opened by [`open_dashboard`].
+const DASHBOARD_WINDOW_LABEL: &str = "dashboard";
 
 /// Name of the event emitted to the frontend whenever the tunnel state changes.
 /// The payload is a serialized [`TunnelStatus`]. The webview listens via
@@ -48,10 +52,10 @@ pub struct StartTunnelArgs {
     /// The `<user>@<host>` SSH target.
     pub target: String,
     /// The forward spec, e.g. `-c web:8080,db:5432` (the leading `-c` is
-    /// optional). May be empty for a dashboard-only tunnel — but note an empty
-    /// string is rejected by the parser, so the frontend should omit forwards by
-    /// sending the dashboard-only form once that is supported; today at least one
-    /// forward is required.
+    /// optional). **Optional**: an empty or omitted string yields a
+    /// dashboard-only tunnel (just the always-present 7777 forward), parsed via
+    /// [`crate::tunnel::parse_forwards_optional`].
+    #[serde(default)]
     pub forwards: String,
     /// jonggrang project id used to resolve `~/.jonggrang/web/ssh/<id>.key`
     /// first, then `global.key`, then `~/.ssh/id_rsa`. Optional.
@@ -208,6 +212,48 @@ pub fn list_forwards(
     manager: State<'_, SharedTunnelManager>,
 ) -> Result<Vec<ForwardView>, String> {
     Ok(snapshot(manager.inner())?.forwards)
+}
+
+/// Resolve the URL the dashboard is reachable at. When the tunnel is running we
+/// use the dashboard forward's actual local URL (in case 7777 was bumped on a
+/// port collision), otherwise we fall back to the canonical 7777.
+fn dashboard_local_url(manager: &SharedTunnelManager) -> String {
+    if let Ok(mut mgr) = manager.lock() {
+        if let Some(h) = mgr
+            .health()
+            .into_iter()
+            .find(|h| h.container_id == DASHBOARD_CONTAINER_ID)
+        {
+            return h.local_url;
+        }
+    }
+    format!("http://localhost:{DASHBOARD_LOCAL_PORT}")
+}
+
+/// Open the jonggrang dashboard in its own in-app webview window so the user can
+/// view it at `http://localhost:7777` without leaving the desktop app. The
+/// window is created from Rust (so no extra JS-side ACL permission is needed);
+/// if it is already open we just focus it instead of stacking duplicates.
+#[tauri::command]
+pub fn open_dashboard(
+    app: AppHandle,
+    manager: State<'_, SharedTunnelManager>,
+) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(DASHBOARD_WINDOW_LABEL) {
+        existing.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let url = dashboard_local_url(manager.inner());
+    let parsed = url
+        .parse()
+        .map_err(|_| format!("invalid dashboard URL: {url}"))?;
+    WebviewWindowBuilder::new(&app, DASHBOARD_WINDOW_LABEL, WebviewUrl::External(parsed))
+        .title("Jonggrang Dashboard")
+        .inner_size(1100.0, 820.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]

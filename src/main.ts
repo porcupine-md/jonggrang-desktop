@@ -45,8 +45,6 @@ const TUNNEL_STATUS_EVENT = "tunnel-status";
 const STORAGE_KEY = "jonggrang.tunnel.config.v1";
 /** Container id the backend uses for the always-present dashboard forward. */
 const DASHBOARD_CONTAINER_ID = "dashboard";
-/** Canonical dashboard URL — the backend pins the dashboard forward to 7777. */
-const DASHBOARD_LOCAL_URL = "http://localhost:7777";
 /** Human-readable labels for the backend's lowercase status wire strings. */
 const STATUS_LABELS: Record<string, string> = {
   connecting: "Connecting…",
@@ -154,9 +152,14 @@ function saveConfig(config: TunnelConfig): void {
 /**
  * Assemble the raw forward spec string the backend parser expects, e.g.
  * `-c web:8080,db:5432`. The dashboard forward is added by the backend and is
- * intentionally NOT included here.
+ * intentionally NOT included here. Container forwards are optional: with none
+ * configured this returns an empty string, which the backend treats as a
+ * dashboard-only tunnel.
  */
 function buildForwardsSpec(forwards: ContainerForward[]): string {
+  if (forwards.length === 0) {
+    return "";
+  }
   const parts = forwards.map((f) => `${f.containerId}:${f.remotePort}`);
   return `-c ${parts.join(",")}`;
 }
@@ -233,10 +236,9 @@ function readSetupForm(): TunnelConfig {
   if (!/^[^@\s]+@[^@\s]+$/.test(target)) {
     throw new Error('Server target must look like "<user>@<server>".');
   }
+  // Container forwards are optional — with none, the backend still opens the
+  // always-present dashboard forward (http://localhost:7777).
   const forwards = collectForwards();
-  if (forwards.length === 0) {
-    throw new Error("Add at least one container forward.");
-  }
   return {
     target,
     keyPath: byId<HTMLInputElement>("key-input").value.trim(),
@@ -283,6 +285,15 @@ function statusLabel(status: string): string {
   return STATUS_LABELS[status] ?? status;
 }
 
+/**
+ * Open the jonggrang dashboard inside its own in-app webview window (at
+ * http://localhost:7777) via the backend `open_dashboard` command, instead of
+ * handing it off to an external browser.
+ */
+async function openDashboardWindow(): Promise<void> {
+  await invokeCommand<void>("open_dashboard");
+}
+
 async function openLocalUrl(url: string): Promise<void> {
   // Prefer the opener plugin (opens in the system browser) when present;
   // otherwise fall back to a normal window.open.
@@ -317,7 +328,12 @@ function renderForwardCard(forward: ForwardView): HTMLElement {
   link.textContent = forward.localUrl;
   link.addEventListener("click", (event) => {
     event.preventDefault();
-    openLocalUrl(forward.localUrl).catch((err) => showError(String(err)));
+    // The dashboard forward opens in-app; other forwards open externally.
+    const opened =
+      forward.containerId === DASHBOARD_CONTAINER_ID
+        ? openDashboardWindow()
+        : openLocalUrl(forward.localUrl);
+    opened.catch((err) => showError(String(err)));
   });
 
   const ports = document.createElement("div");
@@ -478,7 +494,7 @@ function wireDashboard(): void {
   });
   byId("summary-dashboard").addEventListener("click", (event) => {
     event.preventDefault();
-    openLocalUrl(DASHBOARD_LOCAL_URL).catch((err) => showError(String(err)));
+    openDashboardWindow().catch((err) => showError(String(err)));
   });
   byId("error-dismiss").addEventListener("click", () => clearError());
 }

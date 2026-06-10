@@ -35,6 +35,7 @@ pub fn run() {
             commands::stop_tunnel,
             commands::tunnel_status,
             commands::list_forwards,
+            commands::open_dashboard,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
