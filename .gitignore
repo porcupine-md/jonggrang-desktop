@@ -10,3 +10,4 @@ src/*.js
 # Rust / Tauri build artifacts
 target/
 src-tauri/target/
+.DS_Store
