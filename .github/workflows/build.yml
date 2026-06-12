@@ -1,16 +1,18 @@
-# Build macOS + Linux release bundles for the Jonggrang Tunnel desktop app.
+# Build signed/notarized release bundles for the Jonggrang Tunnel desktop app
+# across macOS (universal: Intel + Apple Silicon) and Linux.
 #
-# WHY A MATRIX (and not a single Linux job): Tauri cannot cross-compile a macOS
-# bundle from Linux — the macOS .app/.dmg needs the Apple SDK + codesign tooling
-# that only exists on a macOS host. There is no Linux→macOS cross-compile path,
-# so the only way to produce BOTH platform binaries is to run the build on its
-# own native runner: `macos-latest` for .dmg/.app and `ubuntu-latest` for
-# .deb/.AppImage. This workflow is the canonical way to obtain both binaries.
+# WHY A MATRIX (and not a single job): Tauri cannot cross-compile a bundle for
+# one OS from another — each platform's bundle needs that platform's native
+# toolchain (Apple SDK + codesign on macOS, WebKitGTK on Linux). The only way to
+# produce BOTH platform binaries is to run each build on its own native runner.
+#
+# macOS bundles are CODE-SIGNED + NOTARIZED when the Apple secrets below are
+# present (see SIGNING.md). Without those secrets the macOS leg still builds,
+# but produces an UNSIGNED .dmg that other Macs flag as "damaged" / "unverified
+# developer". Linux needs no signing.
 #
 # All third-party actions are pinned to specific released versions to keep CI
-# reproducible and avoid drift when an action publishes a new major/minor. For
-# stricter supply-chain hardening these tags can be swapped for the equivalent
-# full-length commit SHAs.
+# reproducible. For stricter supply-chain hardening swap tags for commit SHAs.
 name: build
 
 on:
@@ -31,15 +33,21 @@ jobs:
       # the run is triggered by a version tag push. Harmless on branch/PR runs.
       contents: write
     strategy:
-      # Don't cancel the macOS leg if Linux fails (or vice-versa) — we want both
-      # binaries even if one platform breaks.
+      # Don't cancel other legs if one platform fails — we want every binary we
+      # can get even if one platform breaks.
       fail-fast: false
       matrix:
-        # macos-latest → .dmg/.app  |  ubuntu-latest → .deb/.AppImage.
-        # macOS MUST build on a macOS runner (no cross-compile from Linux).
-        platform:
-          - macos-latest
-          - ubuntu-latest
+        include:
+          # macOS: one universal binary covering Intel (x86_64) AND Apple Silicon
+          # (aarch64). `--target universal-apple-darwin` makes Tauri lipo both
+          # arch slices into a single .app/.dmg that runs on any modern Mac.
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+          # Linux: .deb + .AppImage. No signing required.
+          - platform: ubuntu-latest
+            args: ''
+            rust-targets: ''
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -48,7 +56,7 @@ jobs:
 
       # Linux-only: the WebKit/GTK stack tauri/wry link against is not present on
       # a bare ubuntu-latest runner. Install it BEFORE any cargo build/test so the
-      # libdbus/webkit2gtk/libsoup sys-deps resolve. (macOS uses the system WebKit.)
+      # libdbus/webkit2gtk/libsoup sys-deps resolve. (macOS/Windows use system WebView.)
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-latest'
         run: |
@@ -68,9 +76,11 @@ jobs:
 
       - name: Set up Rust toolchain
         # dtolnay/rust-toolchain is the Tauri-recommended toolchain action; it is
-        # channel-pinned here to `stable`. Pin to a commit SHA for stricter
-        # supply-chain hardening.
+        # channel-pinned here to `stable`. `targets` adds extra compile targets
+        # (both macOS arches for the universal build); empty on other platforms.
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2.7.5
@@ -81,37 +91,47 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Run the Rust unit/integration tests on BOTH legs — the tunnel-spec
-      # parsing, port allocation, and lifecycle logic must pass on macOS and Linux.
+      # Run the Rust unit/integration tests on every leg — the tunnel-spec
+      # parsing, port allocation, and lifecycle logic must pass on all platforms.
       - name: Run Rust tests
         working-directory: src-tauri
         run: cargo test
 
-      # Build the release bundles. On a version-tag push, tauri-action also
-      # creates/updates a GitHub Release and attaches the bundles to it; on
-      # branch/PR runs tagName is empty so it just builds (no Release).
+      # Build (and on a version tag, release) the bundles. macOS signing +
+      # notarization kick in automatically when the APPLE_* env below are set as
+      # repo secrets; otherwise the macOS bundle is unsigned. See SIGNING.md.
       - name: Build release bundles
         uses: tauri-apps/tauri-action@v0.5.20
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- macOS code signing (Developer ID Application) ---
+          # base64-encoded .p12 cert + its password, and the identity string.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # --- macOS notarization (Apple ID + app-specific password) ---
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           # tagName empty on non-tag runs → tauri-action builds without releasing.
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Jonggrang Tunnel {0}', github.ref_name) || '' }}
-          releaseBody: 'Automated macOS (.dmg/.app) and Linux (.deb/.AppImage) bundles built by CI.'
+          releaseBody: 'Automated macOS (universal .dmg/.app) and Linux (.deb/.AppImage) bundles built by CI.'
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}
 
       # Upload the built bundles as workflow artifacts on EVERY run (branch, PR,
       # and tag) so they're downloadable from the Actions run page regardless of
-      # whether a Release was cut.
+      # whether a Release was cut. Per-OS paths differ; missing ones are warned.
       - name: Upload bundles as artifacts
         uses: actions/upload-artifact@v4.4.3
         with:
           name: bundles-${{ matrix.platform }}
           path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/macos/*.app
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+            src-tauri/target/**/release/bundle/macos/*.app
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: warn
