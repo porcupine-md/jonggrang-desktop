@@ -7,9 +7,15 @@
 # produce BOTH platform binaries is to run each build on its own native runner.
 #
 # macOS bundles are CODE-SIGNED + NOTARIZED when the Apple secrets below are
-# present (see SIGNING.md). Without those secrets the macOS leg still builds,
-# but produces an UNSIGNED .dmg that other Macs flag as "damaged" / "unverified
-# developer". Linux needs no signing.
+# present. Without those secrets the macOS leg still builds, but produces an
+# UNSIGNED .dmg that other Macs flag as "damaged" / "unverified developer".
+# Linux needs no signing.
+#
+# macOS signing & notarization: on tag pushes (v*), the macOS leg imports the
+# Developer ID certificate from secrets and sets APPLE_SIGNING_IDENTITY /
+# APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID so tauri-action can codesign +
+# notarize the .app and .dmg. The app-specific password is created at
+# appleid.apple.com → App-Specific Passwords.
 #
 # All third-party actions are pinned to specific released versions to keep CI
 # reproducible. For stricter supply-chain hardening swap tags for commit SHAs.
@@ -17,7 +23,6 @@ name: build
 
 on:
   push:
-    # Feature branch CI + version tags (e.g. v1.2.3) which also cut a Release.
     branches:
       - feat/jonggrang-tunnel-desktop
     tags:
@@ -29,22 +34,14 @@ on:
 jobs:
   build:
     permissions:
-      # `contents: write` lets tauri-action create/attach a GitHub Release when
-      # the run is triggered by a version tag push. Harmless on branch/PR runs.
       contents: write
     strategy:
-      # Don't cancel other legs if one platform fails — we want every binary we
-      # can get even if one platform breaks.
       fail-fast: false
       matrix:
         include:
-          # macOS: one universal binary covering Intel (x86_64) AND Apple Silicon
-          # (aarch64). `--target universal-apple-darwin` makes Tauri lipo both
-          # arch slices into a single .app/.dmg that runs on any modern Mac.
           - platform: macos-latest
             args: '--target universal-apple-darwin'
             rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
-          # Linux: .deb + .AppImage. No signing required.
           - platform: ubuntu-latest
             args: ''
             rust-targets: ''
@@ -54,9 +51,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
 
-      # Linux-only: the WebKit/GTK stack tauri/wry link against is not present on
-      # a bare ubuntu-latest runner. Install it BEFORE any cargo build/test so the
-      # libdbus/webkit2gtk/libsoup sys-deps resolve. (macOS/Windows use system WebView.)
       - name: Install Linux build dependencies
         if: matrix.platform == 'ubuntu-latest'
         run: |
@@ -71,13 +65,9 @@ jobs:
         uses: actions/setup-node@v4.1.0
         with:
           node-version: 20
-          # Cache the npm download cache keyed off package-lock.json.
           cache: npm
 
       - name: Set up Rust toolchain
-        # dtolnay/rust-toolchain is the Tauri-recommended toolchain action; it is
-        # channel-pinned here to `stable`. `targets` adds extra compile targets
-        # (both macOS arches for the universal build); empty on other platforms.
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-targets }}
@@ -85,36 +75,33 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2.7.5
         with:
-          # Cargo.toml/Cargo.lock live in src-tauri, so cache that workspace.
           workspaces: src-tauri
 
       - name: Install frontend dependencies
         run: npm ci
 
-      # Run the Rust unit/integration tests on every leg — the tunnel-spec
-      # parsing, port allocation, and lifecycle logic must pass on all platforms.
       - name: Run Rust tests
         working-directory: src-tauri
         run: cargo test
 
-      # Build (and on a version tag, release) the bundles. macOS signing +
-      # notarization kick in automatically when the APPLE_* env below are set as
-      # repo secrets; otherwise the macOS bundle is unsigned. See SIGNING.md.
+      - name: Import Apple signing certificate
+        if: matrix.platform == 'macos-latest'
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
       - name: Build release bundles
         uses: tauri-apps/tauri-action@v0.5.20
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # --- macOS code signing (Developer ID Application) ---
-          # base64-encoded .p12 cert + its password, and the identity string.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # --- macOS notarization (Apple ID + app-specific password) ---
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          # tagName empty on non-tag runs → tauri-action builds without releasing.
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Jonggrang Tunnel {0}', github.ref_name) || '' }}
           releaseBody: 'Automated macOS (universal .dmg/.app) and Linux (.deb/.AppImage) bundles built by CI.'
@@ -122,9 +109,6 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      # Upload the built bundles as workflow artifacts on EVERY run (branch, PR,
-      # and tag) so they're downloadable from the Actions run page regardless of
-      # whether a Release was cut. Per-OS paths differ; missing ones are warned.
       - name: Upload bundles as artifacts
         uses: actions/upload-artifact@v4.4.3
         with:
