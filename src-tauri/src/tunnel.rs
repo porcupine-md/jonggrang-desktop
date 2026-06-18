@@ -127,8 +127,9 @@ impl AllocatedForward {
 pub struct TunnelPlan {
     /// The `user@host` to SSH into.
     pub target: TunnelTarget,
-    /// The always-present dashboard forward (local 7777 → remote 7777 by
-    /// default, bumped only on collision).
+    /// The always-present dashboard forward. The local port defaults to 7777
+    /// (bumped only on collision, or set to a custom published port); the remote
+    /// port is always the fixed [`DASHBOARD_REMOTE_PORT`].
     pub dashboard: AllocatedForward,
     /// The container forwards, in request order, each with a distinct local port.
     pub forwards: Vec<AllocatedForward>,
@@ -332,13 +333,16 @@ pub fn build_tunnel_plan(
 
 /// Build a [`TunnelPlan`] with an explicit dashboard port.
 ///
-/// `dashboard_port` is used both as the dashboard's **remote** port (the port
-/// the jonggrang dashboard listens on, behind [`DASHBOARD_FORWARD_HOST`]) and as
-/// the **preferred local** port; on a local collision it falls back upward like
-/// any other forward. Each container forward is then allocated a distinct local
-/// port starting from [`FORWARD_LOCAL_PORT_BASE`], skipping anything already
-/// taken — both ports passed in via `reserved` and ports handed to earlier
-/// forwards in this same plan.
+/// `dashboard_port` is only the dashboard's **preferred local (published)**
+/// port; on a local collision it falls back upward like any other forward. The
+/// dashboard's **remote** port is always [`DASHBOARD_REMOTE_PORT`] (the port the
+/// jonggrang dashboard listens on inside the server, behind
+/// [`DASHBOARD_FORWARD_HOST`]) — only the published port is configurable, so
+/// e.g. a custom `7666` yields `-L 7666:host.docker.internal:7777`. Each
+/// container forward is then allocated a distinct local port starting from
+/// [`FORWARD_LOCAL_PORT_BASE`], skipping anything already taken — both ports
+/// passed in via `reserved` and ports handed to earlier forwards in this same
+/// plan.
 ///
 /// `reserved` is an externally-known in-use set (e.g. ports other tunnels hold);
 /// it is treated as read-only and copied internally.
@@ -355,7 +359,10 @@ pub fn build_tunnel_plan_with(
     in_use.insert(dashboard_local);
     let dashboard = AllocatedForward {
         container_id: DASHBOARD_CONTAINER_ID.to_string(),
-        remote_port: dashboard_port,
+        // The dashboard always listens on the fixed remote port inside the
+        // jonggrang server; `dashboard_port` only chooses the *published* local
+        // port. So `-L 7666:host.docker.internal:7777`, never `…:7666`.
+        remote_port: DASHBOARD_REMOTE_PORT,
         local_port: dashboard_local,
     };
 
@@ -410,7 +417,9 @@ pub fn parse_forwards_optional(input: &str) -> Result<Vec<Forward>, TunnelSpecEr
 ///
 /// `port` overrides the SSH port; `None` keeps the [`DEFAULT_SSH_PORT`] (2222)
 /// that [`parse_target`] assigns. `dashboard_port` overrides the dashboard
-/// forward's port; `None` keeps the canonical [`DASHBOARD_LOCAL_PORT`] (7777).
+/// forward's **published local** port (its remote port stays the fixed
+/// [`DASHBOARD_REMOTE_PORT`]); `None` keeps the canonical
+/// [`DASHBOARD_LOCAL_PORT`] (7777).
 pub fn build_plan_from_spec(
     target: &str,
     forwards: &str,
@@ -1509,15 +1518,31 @@ mod tests {
 
     #[test]
     fn build_plan_from_spec_honors_dashboard_port_override() {
-        // An explicit dashboard port drives both the preferred local port and
-        // the remote port the dashboard listens on.
+        // An explicit dashboard port only changes the published local port; the
+        // remote port the dashboard listens on stays fixed at 7777, so the
+        // forward is `8888:host.docker.internal:7777`, not `…:8888`.
         let plan = build_plan_from_spec("deploy@srv", "", None, Some(8888), &in_use(&[])).unwrap();
         assert_eq!(plan.dashboard.local_port, 8888);
-        assert_eq!(plan.dashboard.remote_port, 8888);
+        assert_eq!(plan.dashboard.remote_port, DASHBOARD_REMOTE_PORT);
         assert_eq!(plan.dashboard.local_url(), "http://localhost:8888");
         // None → the canonical 7777 is still the default.
         let default = build_plan_from_spec("deploy@srv", "", None, None, &in_use(&[])).unwrap();
         assert_eq!(default.dashboard.local_port, DASHBOARD_LOCAL_PORT);
+    }
+
+    #[test]
+    fn custom_dashboard_port_only_changes_published_port_in_ssh_args() {
+        // Regression: publishing the dashboard on 7666 must yield
+        // `-L 7666:host.docker.internal:7777` — only the published port moves,
+        // the remote port stays 7777.
+        let plan = build_plan_from_spec("deploy@srv", "", None, Some(7666), &in_use(&[]))
+            .unwrap();
+        let args = build_ssh_args(&plan.target, Path::new("/k"), &plan.dashboard);
+        assert!(
+            args.contains(&"7666:host.docker.internal:7777".to_string()),
+            "expected 7666:host.docker.internal:7777, got {args:?}",
+        );
+        assert!(!args.iter().any(|a| a == "7666:host.docker.internal:7666"));
     }
 
     #[test]
