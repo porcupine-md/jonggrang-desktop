@@ -1,2 +1,343 @@
 # Jonggrang Progress Log — Jonggrang-desktop
 # Created: 2026-06-10
+
+## task-001 — Phase 1a: Scaffold Node/TypeScript frontend toolchain (DONE 2026-06-10)
+- Created package.json (name jonggrang-tunnel-desktop, private, type:module),
+  tsconfig.json (ES2020 / ESNext / moduleResolution bundler / strict, include ['src']),
+  and .gitignore (node_modules/, dist/, target/, src-tauri/target/).
+- Tauri pinned to ^2: @tauri-apps/api (runtime) + @tauri-apps/cli (dev). Pinning to ^2
+  is deliberate to avoid v1/v2 config drift — keep this when adding Rust side (task-002).
+- GOTCHA: did NOT run `npm install` or `tsc` — no src/ files exist yet and deps aren't
+  installed (later phases). A real typecheck only becomes meaningful once src/ lands.
+  Validation here was limited to JSON well-formedness (both files parse).
+- GOTCHA: `git status` shows many `.jonggrang/**` entries in the index from worktree
+  setup. Do NOT `git add -A`. Used `git reset` + explicit `git add package.json
+  tsconfig.json .gitignore` to keep jonggrang state out of the feature commit.
+- tsconfig uses noEmit:true; the build script runs `tsc && tauri build` where tsc is a
+  typecheck gate. Frontend emit/bundling is handled by Tauri's dev server config (later).
+
+## task-002 — Phase 1b: Scaffold Rust/Tauri v2 backend skeleton (DONE 2026-06-10)
+- Created src-tauri/: Cargo.toml, build.rs, tauri.conf.json, src/main.rs, src/lib.rs,
+  and icons/ (32x32, 128x128, 128x128@2x PNGs + icon.png/.ico/.icns).
+- LAYOUT: used idiomatic Tauri v2 lib/bin split — src/lib.rs holds `run()`
+  (with #[cfg_attr(mobile, tauri::mobile_entry_point)]) and the stub
+  invoke_handler; src/main.rs is a thin shim (console-window guard +
+  jonggrang_tunnel_lib::run()). Cargo [lib] name = jonggrang_tunnel_lib,
+  crate-type = staticlib/cdylib/rlib. ADDED src/lib.rs beyond the task's `files`
+  array because criterion (1) explicitly requires the v2 lib/bin convention —
+  recorded files via `jonggrang task update --files`. task-005 wires real
+  #[tauri::command]s into the generate_handler![] list (currently empty stub).
+- CONFIG: tauri.conf.json uses $schema v2, identifier id.maia.jonggrang.tunnel.
+  build.frontendDist = "../src" (static TS frontend, no bundler), beforeBuildCommand
+  = "tsc" (typecheck gate; do NOT set it to "npm run build" — package.json build is
+  `tsc && tauri build`, which would recurse). devUrl = http://localhost:1420 is the
+  conventional default but there is NO dev server yet (package.json `dev` = `tauri dev`
+  only) — the frontend phase (task-005-ish) must either serve ../src statically or add
+  a dev server, else `tauri dev` can't connect. bundle.targets = deb/appimage/dmg/app
+  (lowercase "appimage" per v2 serde).
+- GOTCHA (validation): cannot run `cargo check`/`tauri build` locally — Linux WebKit
+  build deps (libwebkit2gtk-4.1-dev, libsoup-3.0-dev, build-essential, librsvg2-dev)
+  are absent (documented as a Cargo.toml header comment + for the docs/CI tasks).
+  Validation done: JSON parse of tauri.conf.json, `cargo verify-project` (success),
+  PNG/ICNS/ICO magic-byte checks, and `rustc --emit=metadata` on lib.rs (only E0433
+  unresolved-`tauri`-crate errors, i.e. no syntax errors).
+- ICONS: generated as real valid files via a pure-Python zlib PNG encoder; .ico wraps
+  a 256px PNG (Vista+ PNG-in-ICO) and .icns wraps ic07/ic08/ic09 PNG entries. Solid
+  color placeholders — replace with real branding later.
+
+## task-003 — Phase 2: Tunnel spec parsing & local-port allocation (DONE 2026-06-10)
+- Created src-tauri/src/tunnel.rs (pure logic) and registered it via `pub mod tunnel;`
+  in src/lib.rs (ADDED lib.rs beyond the task `files` array — a module file is dead
+  code unless declared, so cargo test wouldn't even compile/run the tests without it;
+  recorded both via `jonggrang task update --files`, same precedent as task-002).
+- API: parse_target("<user>@<host>") -> TunnelTarget; parse_forwards("-c a:80,b:90")
+  -> Vec<Forward>; build_tunnel_plan(target, forwards, &reserved) -> TunnelPlan;
+  build_plan_from_spec(...) one-shot. Constants DASHBOARD_LOCAL_PORT/DASHBOARD_REMOTE_PORT
+  = 7777, FORWARD_LOCAL_PORT_BASE = 7778. Typed TunnelSpecError (Display + Error).
+- DESIGN: dashboard allocated FIRST (keeps canonical 7777, bumps up only on collision);
+  forwards fan out from 7778, each via next_free_local_port() which scans monotonically
+  upward skipping an in-use HashSet (the externally-reserved set PLUS ports already handed
+  to earlier forwards in this plan). 65535 exhaustion -> NoFreePort. All pure: no spawn,
+  no net, no OS probe — OS-level port probing is task-004 lifecycle's job.
+- KEPT IT std-ONLY (no serde/tauri) so it is testable in isolation. Serde derives for the
+  Tauri bridge can be layered on in task-004/005 if the webview needs to receive a plan.
+- GOTCHA (`-c` flag stripping): only strip a leading `-c` when it stands alone (followed
+  by whitespace or end), NEVER when it prefixes a container id like "cache:80"/"-cache:80".
+  parse_port rejects 0 and >65535 (u16 parse covers the upper bound).
+- VALIDATION GOTCHA: full `cargo test` STILL cannot run locally — it now fails earlier than
+  task-002 expected, at the `libdbus-sys` build script (needs system `dbus-1.pc`; webkit is
+  next). Same class of missing-Linux-dep issue; CI (task-006) installs them. Workaround that
+  DOES validate: `rustc --test --edition 2021 src/tunnel.rs -o /tmp/t && /tmp/t` compiles the
+  module standalone (std-only, so no crate deps) and ran all 30 unit tests green. Use this
+  pattern to test any future pure, dep-free Rust module without the tauri sys-dep wall.
+
+## task-004 — Phase 3: SSH tunnel lifecycle manager (DONE 2026-06-10)
+- Extended src-tauri/src/tunnel.rs (files array = ONLY tunnel.rs; no lib.rs change needed —
+  tunnel is already `pub mod`'d). Kept it std-ONLY on purpose so the standalone
+  `rustc --test --edition 2021 src/tunnel.rs -o /tmp/t && /tmp/t` validation still works:
+  51 tests green (30 from task-003 + 21 new). Full `cargo test` still blocked by the
+  libdbus/webkit sys-dep wall (unchanged from task-003).
+- DESIGN: TunnelManager { forwards: Vec<ForwardProcess> }, Send+Sync (all-std fields).
+  Exposed `pub type SharedTunnelManager = Arc<Mutex<TunnelManager>>` as the intended
+  Tauri managed-state shape (task-005 wires it). ONE ssh child per forward (not a single
+  multi -L) so each forward has independent status + teardown.
+- TEARDOWN (key decision): RAII via `impl Drop for ForwardProcess` (kill + wait-to-reap +
+  join stderr thread). TunnelManager::stop() just does `self.forwards.clear()` — dropping
+  each ForwardProcess reaps it. This is the leak guarantee on stop/exit/panic-unwind; only
+  app SIGKILL can still leak (documented). task-005 must call stop() from tauri
+  RunEvent::Exit/ExitRequested; Drop is the backstop. Note: kill() on an already-exited
+  child errors on some platforms — ignore it (`let _ =`).
+- STATUS INFERENCE: pure `classify_ssh_log_line(&str) -> Option<SshLogSignal>` (lowercases,
+  checks FAILURES BEFORE success so a late fatal line wins) + a background thread per child
+  reading ChildStderr line-by-line folding signals into Arc<Mutex<ForwardStatus>>. Reconciled
+  in ForwardProcess::current_status() strongest-first: child.try_wait() (exited→Stopped if
+  success else Failed) > active probe_local_port() (open loopback = Connected) > thread status.
+  The 0600 gotcha shows up BOTH as a pre-flight SshKeyError::BadPermissions (with path +
+  chmod 600 hint) AND as a runtime stderr SshFailure::KeyPermissions ("bad owner or
+  permissions" / "unprotected private key file").
+- KEY RESOLUTION: ssh_key_candidates(project_id, home) models sandbox.js resolveProjectSshKey
+  precedence (<id>.key -> global.key -> ~/.ssh/id_rsa). resolve_ssh_key_with(cands, exists_fn)
+  takes an injected predicate so precedence is unit-tested WITHOUT touching the FS; the real
+  resolve_ssh_key uses `Path::is_file`. Only the key PATH is passed to ssh via -i — contents
+  never read (mode checked via PermissionsExt under #[cfg(unix)]; #[cfg(not(unix))] no-op).
+- GOTCHA (probe test without a live server): bind TcpListener to 127.0.0.1:0 to learn a free
+  port, DROP it, then probe_local_port(port) must be false. Deterministic, no SSH/server.
+- ssh args (pure build_ssh_args): -i <key> -N -v -o BatchMode=yes (no GUI pw-hang) -o
+  ExitOnForwardFailure=yes (so a failed forward EXITS → Failed detection works) -o
+  ServerAliveInterval=15 -L <local>:localhost:<remote> <user>@<host> (target LAST).
+- Used `reader.lines().map_while(Result::ok)` (needs Rust 1.57+; cargo 1.96 fine) instead of
+  the deprecated-ish `.flatten()` on a Lines iterator.
+
+## task-005 — Phase 4: Tauri commands bridge + live state events (DONE 2026-06-10)
+- Created src-tauri/src/commands.rs and wired it via lib.rs run() (ADDED lib.rs beyond
+  the task `files` array — the v2 builder/invoke_handler lives in run(), not main.rs;
+  same precedent as task-002/003/004, recorded via `jonggrang task update --files`).
+  main.rs stays the thin shim (only a doc-comment tweak). DECISION: despite the task
+  saying "main.rs registers commands", the established v2 lib/bin split (task-002) puts
+  the builder in lib.rs::run(); registering there (not main.rs) is the correct reading.
+- API: 4 #[tauri::command]s — start_tunnel(app, State<SharedTunnelManager>, StartTunnelArgs)
+  -> Result<TunnelStatus,String>, stop_tunnel, tunnel_status, list_forwards. start_tunnel
+  builds the plan via build_plan_from_spec (task-003), resolves the key by PATH via
+  resolve_default_ssh_key (key_path override or jonggrang precedence), then mgr.start()
+  (which runs check_key_permissions → the 0600 gotcha surfaces as the Err string).
+- SERDE BOUNDARY (key pattern): tunnel.rs is deliberately serde-free/std-only, so commands.rs
+  owns the DTOs (StartTunnelArgs/TunnelStatus/ForwardView, all #[serde(rename_all="camelCase")])
+  and converts at the edge via `impl From<ForwardHealth> for ForwardView` (status rendered with
+  ForwardStatus' Display → stable lowercase wire string). Do NOT add serde to tunnel.rs.
+- EVENTS: `use tauri::Emitter;` then `app.emit("tunnel-status", &status)` after every state
+  change (start/stop) so the UI never polls. The same TunnelStatus is both the command return
+  AND the event payload. emit failures are swallowed (return value is authoritative).
+- TEARDOWN: lib.rs uses `.build(ctx).expect(..).run(|_,event| if RunEvent::Exit { mgr.stop() })`
+  instead of plain `.run()` so the exit hook reaps ssh children; ForwardProcess Drop is the
+  RAII backstop. SharedTunnelManager = Arc<Mutex<..>> is `.manage()`d; commands take
+  State<'_, SharedTunnelManager> and `manager.lock()` (State derefs Arc→Mutex). Use
+  `manager.inner()` to pass `&SharedTunnelManager` to helpers (snapshot/emit).
+- VALIDATION (sys-dep wall unchanged — webkit2gtk-4.1/libsoup-3.0 still MISSING, tauri/wry
+  never compile, so full `cargo build`/`cargo test` still blocked; CI task-006 installs them):
+  (1) standalone `rustc --test src/tunnel.rs` = 51/51 green (no regression).
+  (2) `rustc --emit=metadata --edition 2021 --crate-type lib src/commands.rs` (and lib.rs):
+      ALL errors are E0432/E0433 unresolved-crate + "cannot find attribute serde/tauri" —
+      ZERO local syntax/type errors. Same technique task-002 used for lib.rs.
+  (3) NEW TRICK: exercised the serde DTO contract for real by compiling a mirror of the DTOs
+      against the prebuilt serde rlibs in target/debug/deps — `rustc --extern serde=<rlib>
+      --extern serde_json=<rlib> --extern serde_derive=<.so> -L dependency=target/debug/deps`.
+      GOTCHA: serde 1.0 split into serde_core, and target/debug/deps has TWO versions of each
+      of libserde/libserde_json/libserde_core — you must pair a serde_json with the serde that
+      shares its serde_core, or you get a bogus `&T: serde_core::ser::Serialize` mismatch that
+      looks like a code bug but is just rlib version skew. Working pair here:
+      libserde_json-621f954515962133 + libserde-1eb115a3e4eb7dd7. Confirmed camelCase wire
+      format (containerId/remotePort/localPort/localUrl), From conversion, optional deserialize.
+
+## task-006 — Phase 5: Dashboard webview UI (setup form + live status) (DONE 2026-06-10)
+- Created src/index.html + src/main.ts (the two in-scope files) AND extended scope to
+  tsconfig.json, package.json, src-tauri/tauri.conf.json, .gitignore — each REQUIRED to
+  make the frontend actually load/typecheck (recorded via `jonggrang task update --files`,
+  same precedent as task-002..005). Rationale below.
+- NO-BUNDLER REALITY (key gotcha): the project is a static frontend (tauri.conf
+  frontendDist="../src", no Vite/dev server). A browser/webview therefore CANNOT resolve
+  bare ESM specifiers like `@tauri-apps/api/core` at runtime, and node_modules is NOT part
+  of frontendDist so an import map can't point at it either. SOLUTION: set
+  app.withGlobalTauri=true in tauri.conf.json → Tauri injects `window.__TAURI__` mirroring
+  the api package (window.__TAURI__.core.invoke / .event.listen). main.ts calls through
+  that global. To stay typed without a runtime import, use TYPE-ONLY queries:
+  `type InvokeFn = typeof import("@tauri-apps/api/core").invoke;` (and event.listen) — tsc
+  erases these, so the emitted main.js has ZERO bare imports (verified via grep). This is
+  the literal `@tauri-apps/api` invoke()/listen() the AC asked for, just reached globally.
+- EMIT GOTCHA: task-001 set tsconfig noEmit:true as a "typecheck gate". But with a static
+  frontendDist and beforeBuildCommand="tsc", the served dir needs main.js — noEmit meant it
+  was NEVER produced (build would ship index.html with no script). Flipped noEmit:false so
+  `tsc` typechecks AND emits src/main.js in place (no outDir; include:["src"]). Added
+  `src/*.js` to .gitignore — it's a build artifact, regenerated by the tsc gate, do NOT
+  commit it (only index.html + main.ts are committed).
+- TOOLCHAIN GAP fixed: package.json devDeps had @tauri-apps/cli but NOT `typescript`, so the
+  `tsc` gate had no compiler (npx pulled the bogus tsc@2.0.4 stub). Added typescript ^5.
+  VALIDATION: `npm install` works here (network OK), then `./node_modules/.bin/tsc` exits 0
+  (typecheck green + emit). No eslint/test framework configured (AGENTS.md: test cmd is a
+  no-op echo), so lint/test steps are N/A for the frontend.
+- isolatedModules: main.ts uses only `import type` (erased) so it would become a non-module
+  and trip isolatedModules — added a trailing `export {};` to keep it a module (also needed
+  for the `declare global { interface Window { __TAURI__ } }` augmentation).
+- COMMAND ARG SHAPE: start_tunnel's Rust param is a single struct named `args`, so JS calls
+  invoke("start_tunnel", { args: {...} }) — the OUTER key is the param name. Inside, the
+  StartTunnelArgs fields are camelCase (target/forwards/projectId/keyPath) per its
+  serde(rename_all). Empty keyPath/projectId are OMITTED so the backend uses its key
+  precedence. Forward spec is built as `-c <cid>:<port>,...` (dashboard NOT included — the
+  backend always adds it at 7777). stop/status/list take no args.
+- BACKEND LIMITATION surfaced honestly: the AC wants "per-tunnel and global Start/Stop", but
+  task-005 only exposes GLOBAL start_tunnel/stop_tunnel (no per-forward stop command). Since
+  the frontend must not add backend logic, per-forward cards expose Open/Copy actions only;
+  Start/Stop are global. Noted in a UI hint + here. A future task could add a stop_forward
+  command if per-forward control is wanted.
+- SECRETS: only the key PATH is ever handled (typed into the form or chosen via the optional
+  dialog plugin if window.__TAURI__.dialog exists); contents are never read. Config (target,
+  key PATH, projectId, forwards) is persisted in localStorage under
+  "jonggrang.tunnel.config.v1" so first-launch setup is skipped on later launches.
+- The 0600/owner SSH-key gotcha: backend returns it as a plain Err string from start_tunnel;
+  the catch shows it verbatim in the #error-banner. No special-casing needed in the UI.
+
+## task-007 — Phase 6: GitHub Actions build workflow (mac + linux) (DONE 2026-06-10)
+- Created .github/workflows/build.yml (the only in-scope file). First .github/ content in
+  the repo. Triggers: push on feat/jonggrang-tunnel-desktop + tags 'v*', pull_request on the
+  same branch. Single `build` job, strategy.matrix.platform = [macos-latest, ubuntu-latest],
+  fail-fast:false so one platform's failure still yields the other's binary.
+- WHY THE MATRIX (documented in a header comment per AC-7): Tauri/wry cannot cross-compile a
+  macOS .app/.dmg from Linux (needs Apple SDK + codesign on a macOS host). So the ONLY way to
+  get both binaries is native runners — macos-latest for .dmg/.app, ubuntu-latest for
+  .deb/.AppImage. This workflow is the canonical source of both platform binaries.
+- LINUX DEPS step is gated `if: matrix.platform == 'ubuntu-latest'` and runs FIRST (before any
+  cargo step) — apt-get install libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential
+  librsvg2-dev. This is exactly the sys-dep wall every prior task hit locally (libdbus→webkit);
+  CI is where it actually gets satisfied so `cargo test`/`tauri build` finally compile tauri/wry.
+- cargo test runs on BOTH legs via `working-directory: src-tauri` (Cargo.toml lives there).
+  npm ci runs before it (tauri-action's beforeBuildCommand=tsc needs node_modules).
+- PINNING (AC-7): all third-party actions pinned to specific patch version TAGS, not floating
+  majors — checkout@v4.2.2, setup-node@v4.1.0, Swatinem/rust-cache@v2.7.5,
+  tauri-action@v0.5.20, upload-artifact@v4.4.3. EXCEPTION: dtolnay/rust-toolchain is
+  channel-based (@stable) — the Tauri-recommended toolchain action has no semver release tags;
+  noted in a comment that a commit SHA is the stricter pin. Caching: npm via setup-node
+  `cache: npm`; cargo via Swatinem/rust-cache with `workspaces: src-tauri`.
+- RELEASE-ON-TAG (AC-6): tauri-action itself cuts the GitHub Release. tagName is a conditional
+  expression `${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}` — empty
+  string on branch/PR runs makes tauri-action build WITHOUT releasing; a real tag name makes it
+  create/attach the Release. Needs `permissions: contents: write` on the job + GITHUB_TOKEN env.
+- ARTIFACTS-ALWAYS (AC-6): a separate actions/upload-artifact step runs on EVERY trigger (branch/
+  PR/tag), globbing src-tauri/target/release/bundle/{dmg/*.dmg,macos/*.app,deb/*.deb,
+  appimage/*.AppImage}. name = bundles-${{ matrix.platform }} so the two legs don't collide
+  (upload-artifact@v4 errors on duplicate artifact names). if-no-files-found:warn.
+- VALIDATION: no YAML linter in the toolchain by default (no pyyaml); validated by parsing with
+  `npx js-yaml` (VALID) + a node regex sweep asserting all 7 AC sub-criteria present. Could NOT
+  run the workflow itself (no GH runner / act locally), so correctness of action SHAs/tauri-action
+  behavior is by-spec, not executed — first real run on push is the live check.
+
+## task-008 — Phase 7: Docs & conventions (AGENTS.md, README.md) (DONE 2026-06-10)
+- Edited the two in-scope files only (AGENTS.md, README.md). Docs are markdown — no
+  typecheck/test/lint applies; validation was: confirmed the naming-conventions block
+  (kebab-case.ts / PascalCase.tsx / camelCase / UPPER_SNAKE_CASE) stayed intact and
+  `git diff --stat` touched only those two files.
+- AGENTS.md: filled every TODO section from the ACTUAL implemented behavior recorded in
+  this log (not the plan) — Project Overview, File Structure (src/ static no-bundler +
+  src-tauri/ lib/bin split), Code Patterns (pure core/serde-at-edge, one-ssh-child-per-
+  forward, RAII Drop teardown, inferred status, events-over-polling, window.__TAURI__),
+  Testing (cargo test + the standalone `rustc --test src/tunnel.rs` workaround for the
+  sys-dep wall), Known Gotchas, Architecture Decisions, Dependencies, Development Setup.
+- README.md: full rewrite (was a one-line stub). Sections: how-it-works diagram, usage
+  (first-launch form, dashboard at http://localhost:7777, port strategy, key precedence),
+  DOWNLOAD pre-built binaries (Releases for v* tags + Actions artifacts named
+  `bundles-macos-latest` / `bundles-ubuntu-latest` from task-007), local build (Linux deps
+  + cargo tauri/@tauri-apps/cli), key decisions, layout.
+- REPO URL for download links: pulled from `git remote -v` →
+  github.com/porcupine-md/jonggrang-desktop. Artifact names lifted verbatim from
+  build.yml (`bundles-${{ matrix.platform }}`) so the README matches what CI actually
+  uploads — don't hardcode guesses, read the workflow.
+- Commit type `docs:` (no scope) — pure documentation, atomic, only AGENTS.md + README.md
+  staged.
+
+## Phase 12 — Code-quality review (maintainability) (DONE 2026-06-10)
+- Reviewed the feature surface only: src-tauri/src/{tunnel,commands,lib,main}.rs + src/main.ts
+  + src/index.html. Skipped .claude/.codex/.opencode/hooks (generated scaffolding).
+- Validation both green: tunnel.rs standalone test = 51/51 pass (rustc --test workaround,
+  full cargo test still blocked by WebKit dep wall); `tsc --noEmit` clean (node_modules present).
+- Verdict PASS. 5 non-blocking findings + 1 cross-cutting note, written to
+  .output/.../phase-12-code-quality-review.md. Highlights:
+  * F1 (low-med): src/main.ts DASHBOARD_LOCAL_URL hardcodes :7777, so the dashboard SUMMARY
+    link (index.html:253) ignores a 7777->7778 collision bump; per-forward CARD is fine since
+    it uses live forward.localUrl. Fix = derive summary link from TunnelStatus dashboard entry.
+  * F2 (low): snapshot() holds the manager Mutex across probe_local_port() (blocking connect).
+  * F3 (low): start_tunnel passes empty `reserved`; no live OS reprobe (by-design tradeoff).
+  * F4/F5 (trivial): empty projectId -> ".key" candidate; forwards doccomment drift.
+- Root cause of F1 = Rust<->TS constant duplication (dashboard/7777 in 3 places), inherent to
+  no-bundler/no-codegen. Prefer reading those from backend status over redeclaring in frontend.
+- No code edited (review phase, no task with a files[] array; `jonggrang task next` -> null).
+
+## Phase 13 — Test-planning (DONE 2026-06-10)
+- Strategy phase, no task to claim (`jonggrang task next` -> null); produced plan only, no tests authored.
+- Baseline coverage already COMPLETE for all pure logic: tunnel.rs=51 tests, commands.rs=5 tests (56 total).
+  Verified standalone: `rustc --test --edition 2021 src/tunnel.rs` (WebKit dep wall still blocks full cargo test locally).
+- Gaps are all impure-edge. Prioritized backlog written to .output/.../phase-13-test-plan.md:
+  * P1 probe_local_port via real loopback TcpListener (no ssh, fast) — recommended, no refactor.
+  * P2 TunnelManager start/stop/spawn via INJECTABLE spawn program (fake child e.g. sleep) to cover
+    spawn->track->reap + partial-failure-no-leak (the named child-leak Risk). Needs 1-line seam; keep std-only.
+  * P3 ForwardProcess::current_status reconciliation rides P2's seam (optional).
+  * P4 Tauri command handlers = ACCEPT GAP (mock_builder pulls WebKit wall; handlers are thin lock->delegate->snapshot->emit).
+  * P5 frontend main.ts = OUT OF SCOPE per plan (no Vitest; static webview). F1 :7777 hardcode mismatch only observable E2E.
+- Canonical test cmd unchanged: `cd src-tauri && cargo test` (CI both legs). No secret-content reads in any test (paths only).
+
+## Phase 14 — Testing (DONE 2026-06-10)
+- Implemented the Phase-13 P1+P2(+P3) backlog as real tests in src-tauri/src/tunnel.rs.
+  Count went 51 -> 55 (lifecycle_tests 21 -> 25); commands.rs still 5. Standalone-verified:
+  `rustc --test --edition 2021 src/tunnel.rs -o /tmp/t && /tmp/t` -> 55 passed (WebKit wall still
+  blocks full `cargo test` locally; CI runs it on both legs).
+- Added a 1-line-style INJECTION SEAM (behavior-preserving, public API unchanged so commands.rs is
+  untouched — it still uses start/stop/health/is_running only):
+  * spawn_forward() now delegates to private spawn_forward_process(Command, AllocatedForward) which
+    owns the stdio+reader wiring; spawn_forward just builds the `ssh` Command.
+  * TunnelManager::start() delegates to private start_with(plan,key,spawn_fn) generic over the
+    per-forward spawn fn; production passes spawn_forward, tests inject a stand-in program.
+- New tests:
+  * probe_bound_port_is_true (P1/G1.1): live 127.0.0.1:0 TcpListener -> probe true. Did NOT pair a
+    drop->false re-check in the SAME test: the prior probe's completed handshake leaves lingering
+    kernel state on the port and the negative assert flaked. Negative dir stays in the existing
+    probe_unbound_port_is_false (bind->port->drop->probe, never connected = deterministic).
+  * start_tracks_one_child_per_forward_and_stop_reaps_all (P2/G2.2): inject `sleep 30`; dashboard+2
+    => 3 tracked pids, all Connecting (sleeper binds no port), stop() => is_running false + health empty.
+  * failed_spawn_never_leaks_a_partial_set (P2/G2.3): dashboard spawns, 2nd forward uses a bad path so
+    spawn() errs => Err(TunnelError::Spawn), forwards stays EMPTY (partial dashboard child dropped/reaped),
+    and a clean start_with afterwards still works (manager reusable).
+  * current_status_reports_failed_when_child_exits_nonzero (P3): inject `false`; POLL health up to
+    200x10ms until all Failed (bounded so a regression can't hang). Avoids the try_wait race where an
+    immediate health() call can still see None->Connecting before the child is observed exited.
+- Test helper gotchas: temp_key_0600(tag) writes a real 0600 file in temp_dir so start_with's
+  check_key_permissions pre-flight passes (path only stat'd, never spawned against; no key contents read);
+  unique `tag` per test avoids parallel-run collisions. `sleep`/`false` exist on both Linux+macOS CI legs.
+  No leaked `sleep 30` after the suite (Drop/stop reap confirmed via ps).
+- Did NOT touch P4 (Tauri handlers, accept-gap) or P5 (frontend, out-of-scope). `jonggrang task next`
+  -> null (phase-driven, no task with a files[] array).
+
+[Phase 15 — coverage] 2026-06-10
+- Measured REAL line coverage on pure core src-tauri/src/tunnel.rs via standalone
+  source-based instrumentation (no WebKit deps needed):
+    rustup component add llvm-tools-preview
+    rustc --test -C instrument-coverage src/tunnel.rs -o /tmp/tunnel_cov
+    LLVM_PROFILE_FILE=... run; llvm-profdata merge; llvm-cov report
+- Result: 91.10% lines (788/865), 91.05% regions, 90.08% fns (109/121). 55/55 tests pass.
+- Threshold is 80% (jonggrang.json testing.coverage_threshold) -> PASS.
+- The 12 uncovered fns are all the impure edge (spawn_forward, home_dir,
+  resolve_ssh_key/_default, TunnelManager::start wrapper) tested via injected
+  *_with variants, plus trivial TunnelError/Default trait boilerplate. By design.
+- commands.rs (5 DTO serde tests) + lib.rs (Tauri builder, 0 tests) need the full
+  WebKit stack to compile; not measured locally. Report at
+  .jonggrang/.output/features/jonggrang-tunnel-desktop-mq7tilp6/coverage-report.md
+- Verification-only phase: jonggrang task next -> null, no source files changed.
+
+[Phase 16 — test-quality] 2026-06-10
+- Reviewed all 60 tests for value + assertion correctness: tunnel.rs mod tests (31),
+  tunnel.rs lifecycle_tests (24), commands.rs DTO serde (5). Standalone pure-core run
+  (rustc --test src/tunnel.rs) = 55 passed / 0 failed; 5 commands.rs DTO tests need
+  WebKit stack to link (CI-only) but are trivial serde round-trips.
+- Verdict: PASS. No low-value/tautological tests. Assertions are specific (exact ports,
+  wire-key equality, error variants) not is_ok() smoke. Edge cases + AGENTS.md gotchas
+  covered (-c vs -cache, 0600 boundary, failure-wins-over-established, port exhaustion).
+- Checked 3 apparent overlaps -> all justified (Display vs From paths; constant+literal
+  pin; Send+Sync compile assertion). Concurrency tests are race-aware/bounded.
+- Verification-only: jonggrang task next -> null, no source files changed. Report at
+  .jonggrang/.output/features/jonggrang-tunnel-desktop-mq7tilp6/test-quality-report.md

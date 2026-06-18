@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Compiled frontend (tsc emits alongside the .ts sources in src/)
+src/*.js
+
+# Rust / Tauri build artifacts
+target/
+src-tauri/target/
+.DS_Store

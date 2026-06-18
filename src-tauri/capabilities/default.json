@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the Jonggrang Tunnel main window. Grants the live tunnel-status event subscription (core:event:allow-listen) the webview needs; without any capability file Tauri v2 denies every core plugin command, which is what surfaces as 'Command plugin:event|listen not allowed by ACL'. Custom #[tauri::command] handlers are not ACL-gated, so they keep working.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit"
+  ]
+}

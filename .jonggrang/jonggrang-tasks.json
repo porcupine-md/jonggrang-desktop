@@ -17,8 +17,8 @@
         "tsconfig.json",
         ".gitignore"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T08:44:00.786Z",
+      "started_at": "2026-06-10T08:42:47.235Z",
+      "completed_at": "2026-06-10T08:43:38.084Z",
       "error_log": []
     },
     {
@@ -35,13 +35,19 @@
       "passes": true,
       "files": [
         "src-tauri/Cargo.toml",
-        "src-tauri/tauri.conf.json",
         "src-tauri/build.rs",
+        "src-tauri/tauri.conf.json",
         "src-tauri/src/main.rs",
-        "src-tauri/icons/icon.png"
+        "src-tauri/src/lib.rs",
+        "src-tauri/icons/icon.png",
+        "src-tauri/icons/32x32.png",
+        "src-tauri/icons/128x128.png",
+        "src-tauri/icons/128x128@2x.png",
+        "src-tauri/icons/icon.ico",
+        "src-tauri/icons/icon.icns"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T08:48:00.564Z",
+      "started_at": "2026-06-10T08:44:18.856Z",
+      "completed_at": "2026-06-10T08:47:26.126Z",
       "error_log": []
     },
     {
@@ -57,10 +63,11 @@
       ],
       "passes": true,
       "files": [
-        "src-tauri/src/tunnel.rs"
+        "src-tauri/src/tunnel.rs",
+        "src-tauri/src/lib.rs"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T08:52:52.417Z",
+      "started_at": "2026-06-10T08:48:19.851Z",
+      "completed_at": "2026-06-10T08:52:19.073Z",
       "error_log": []
     },
     {
@@ -78,8 +85,8 @@
       "files": [
         "src-tauri/src/tunnel.rs"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T09:00:00.542Z",
+      "started_at": "2026-06-10T08:54:26.361Z",
+      "completed_at": "2026-06-10T08:59:17.916Z",
       "error_log": []
     },
     {
@@ -96,10 +103,11 @@
       "passes": true,
       "files": [
         "src-tauri/src/commands.rs",
+        "src-tauri/src/lib.rs",
         "src-tauri/src/main.rs"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T09:06:49.445Z",
+      "started_at": "2026-06-10T09:01:55.404Z",
+      "completed_at": "2026-06-10T09:06:09.143Z",
       "error_log": []
     },
     {
@@ -116,10 +124,14 @@
       "passes": true,
       "files": [
         "src/index.html",
-        "src/main.ts"
+        "src/main.ts",
+        "tsconfig.json",
+        "package.json",
+        "src-tauri/tauri.conf.json",
+        ".gitignore"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T09:15:52.921Z",
+      "started_at": "2026-06-10T09:07:03.073Z",
+      "completed_at": "2026-06-10T09:14:54.145Z",
       "error_log": []
     },
     {
@@ -137,8 +149,8 @@
       "files": [
         ".github/workflows/build.yml"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T09:19:03.647Z",
+      "started_at": "2026-06-10T09:15:59.326Z",
+      "completed_at": "2026-06-10T09:18:29.009Z",
       "error_log": []
     },
     {
@@ -157,8 +169,8 @@
         "AGENTS.md",
         "README.md"
       ],
-      "started_at": null,
-      "completed_at": "2026-06-10T09:22:01.598Z",
+      "started_at": "2026-06-10T09:19:15.822Z",
+      "completed_at": "2026-06-10T09:21:32.002Z",
       "error_log": []
     }
   ]

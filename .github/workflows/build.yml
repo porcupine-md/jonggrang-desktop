@@ -1,0 +1,121 @@
+# Build signed/notarized release bundles for the Jonggrang Tunnel desktop app
+# across macOS (universal: Intel + Apple Silicon) and Linux.
+#
+# WHY A MATRIX (and not a single job): Tauri cannot cross-compile a bundle for
+# one OS from another — each platform's bundle needs that platform's native
+# toolchain (Apple SDK + codesign on macOS, WebKitGTK on Linux). The only way to
+# produce BOTH platform binaries is to run each build on its own native runner.
+#
+# macOS bundles are CODE-SIGNED + NOTARIZED when the Apple secrets below are
+# present. Without those secrets the macOS leg still builds, but produces an
+# UNSIGNED .dmg that other Macs flag as "damaged" / "unverified developer".
+# Linux needs no signing.
+#
+# macOS signing & notarization: on tag pushes (v*), the macOS leg imports the
+# Developer ID certificate from secrets and sets APPLE_SIGNING_IDENTITY /
+# APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID so tauri-action can codesign +
+# notarize the .app and .dmg. The app-specific password is created at
+# appleid.apple.com → App-Specific Passwords.
+#
+# All third-party actions are pinned to specific released versions to keep CI
+# reproducible. For stricter supply-chain hardening swap tags for commit SHAs.
+name: build
+
+on:
+  push:
+    branches:
+      - feat/jonggrang-tunnel-desktop
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - feat/jonggrang-tunnel-desktop
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+          - platform: ubuntu-latest
+            args: ''
+            rust-targets: ''
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            build-essential \
+            librsvg2-dev
+
+      - name: Set up Node
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2.7.5
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Import Apple signing certificate
+        if: matrix.platform == 'macos-latest'
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Build release bundles
+        uses: tauri-apps/tauri-action@v0.5.20
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Jonggrang Tunnel {0}', github.ref_name) || '' }}
+          releaseBody: 'Automated macOS (universal .dmg/.app) and Linux (.deb/.AppImage) bundles built by CI.'
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Upload bundles as artifacts
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: bundles-${{ matrix.platform }}
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+            src-tauri/target/**/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn
