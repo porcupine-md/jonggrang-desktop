@@ -12,7 +12,7 @@
 
 [package]
 name = "jonggrang-tunnel"
-version = "0.1.0"
+version = "0.2.0"
 description = "GUI for SSH tunneling into a jonggrang server"
 authors = ["Maia <codex@maia.id>"]
 license = "MIT"
