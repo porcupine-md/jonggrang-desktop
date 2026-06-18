@@ -47,6 +47,8 @@ const STORAGE_KEY = "jonggrang.tunnel.config.v1";
 const DASHBOARD_CONTAINER_ID = "dashboard";
 /** Default SSH port (the jonggrang server's sshd); mirrors the backend default. */
 const DEFAULT_SSH_PORT = 2222;
+/** Default dashboard forward port (local + remote); mirrors the backend default. */
+const DEFAULT_DASHBOARD_PORT = 7777;
 /** Human-readable labels for the backend's lowercase status wire strings. */
 const STATUS_LABELS: Record<string, string> = {
   connecting: "Connecting…",
@@ -81,6 +83,7 @@ interface ContainerForward {
 interface TunnelConfig {
   target: string;
   port: number;
+  dashboardPort: number;
   keyPath: string;
   projectId: string;
   forwards: ContainerForward[];
@@ -138,6 +141,11 @@ function readConfig(): TunnelConfig | null {
         typeof parsed.port === "number" && Number.isInteger(parsed.port)
           ? parsed.port
           : DEFAULT_SSH_PORT,
+      dashboardPort:
+        typeof parsed.dashboardPort === "number" &&
+        Number.isInteger(parsed.dashboardPort)
+          ? parsed.dashboardPort
+          : DEFAULT_DASHBOARD_PORT,
       keyPath: typeof parsed.keyPath === "string" ? parsed.keyPath : "",
       projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
       forwards: parsed.forwards.filter(
@@ -249,12 +257,26 @@ function readSetupForm(): TunnelConfig {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`Invalid SSH port: "${portText}" (expected 1-65535).`);
   }
+  // Dashboard port is optional in the form — a blank field falls back to 7777.
+  const dashboardText = byId<HTMLInputElement>("dashboard-port-input").value.trim();
+  const dashboardPort =
+    dashboardText === "" ? DEFAULT_DASHBOARD_PORT : Number(dashboardText);
+  if (
+    !Number.isInteger(dashboardPort) ||
+    dashboardPort < 1 ||
+    dashboardPort > 65535
+  ) {
+    throw new Error(
+      `Invalid dashboard port: "${dashboardText}" (expected 1-65535).`,
+    );
+  }
   // Container forwards are optional — with none, the backend still opens the
-  // always-present dashboard forward (http://localhost:7777).
+  // always-present dashboard forward (http://localhost:<dashboardPort>).
   const forwards = collectForwards();
   return {
     target,
     port,
+    dashboardPort,
     keyPath: byId<HTMLInputElement>("key-input").value.trim(),
     projectId: byId<HTMLInputElement>("project-input").value.trim(),
     forwards,
@@ -265,6 +287,9 @@ function populateSetupForm(config: TunnelConfig | null): void {
   byId<HTMLInputElement>("target-input").value = config?.target ?? "";
   byId<HTMLInputElement>("port-input").value = String(
     config?.port ?? DEFAULT_SSH_PORT,
+  );
+  byId<HTMLInputElement>("dashboard-port-input").value = String(
+    config?.dashboardPort ?? DEFAULT_DASHBOARD_PORT,
   );
   byId<HTMLInputElement>("key-input").value = config?.keyPath ?? "";
   byId<HTMLInputElement>("project-input").value = config?.projectId ?? "";
@@ -411,6 +436,7 @@ async function startTunnel(config: TunnelConfig): Promise<void> {
       target: config.target,
       forwards: buildForwardsSpec(config.forwards),
       port: config.port,
+      dashboardPort: config.dashboardPort,
     };
     if (config.keyPath) {
       args.keyPath = config.keyPath;
@@ -456,6 +482,13 @@ function showSetup(config: TunnelConfig | null): void {
 
 function showDashboard(config: TunnelConfig): void {
   byId("summary-target").textContent = config.target;
+  // Reflect the configured dashboard port in the summary link (the live URL
+  // after start comes from the backend, in case the port was bumped on a
+  // collision).
+  const dashboardLink = byId<HTMLAnchorElement>("summary-dashboard");
+  const dashboardUrl = `http://localhost:${config.dashboardPort}`;
+  dashboardLink.href = dashboardUrl;
+  dashboardLink.textContent = dashboardUrl;
   setHidden(byId("setup-view"), true);
   setHidden(byId("dashboard-view"), false);
   // Reflect the current backend state immediately (it survives webview reloads).

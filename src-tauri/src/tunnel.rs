@@ -50,11 +50,6 @@ pub const DASHBOARD_CONTAINER_ID: &str = "dashboard";
 /// `-L <local>:host.docker.internal:<remote>` rather than `localhost`.
 pub const DASHBOARD_FORWARD_HOST: &str = "host.docker.internal";
 
-/// Server-side host every other (`-c` container) forward connects to. These
-/// services listen on the server's own loopback, so they map to
-/// `-L <local>:localhost:<remote>`.
-pub const DEFAULT_FORWARD_HOST: &str = "localhost";
-
 /// Default TCP port `ssh` connects to on the server. The jonggrang server runs
 /// `sshd` on `2222` (not the standard `22`); the user can override it per
 /// connection, but this is the out-of-the-box default.
@@ -113,13 +108,15 @@ impl AllocatedForward {
 
     /// The host on the *server* side that `ssh` connects this forward to. The
     /// dashboard lives on the docker host ([`DASHBOARD_FORWARD_HOST`]); every
-    /// container forward resolves against the server's own loopback
-    /// ([`DEFAULT_FORWARD_HOST`]).
-    pub fn forward_host(&self) -> &'static str {
+    /// container forward is reached by its **container id**, which Docker's
+    /// embedded DNS resolves over the jonggrang server's container network — so
+    /// the forward maps to `-L <local>:<container-id>:<remote>` rather than the
+    /// server's own loopback.
+    pub fn forward_host(&self) -> &str {
         if self.container_id == DASHBOARD_CONTAINER_ID {
             DASHBOARD_FORWARD_HOST
         } else {
-            DEFAULT_FORWARD_HOST
+            &self.container_id
         }
     }
 }
@@ -319,29 +316,46 @@ pub fn next_free_local_port(
     }
 }
 
-/// Build a [`TunnelPlan`] that assigns every forward a **distinct** local port.
+/// Build a [`TunnelPlan`] that assigns every forward a **distinct** local port,
+/// defaulting the dashboard to [`DASHBOARD_LOCAL_PORT`] (7777).
 ///
-/// The dashboard forward is allocated first, preferring [`DASHBOARD_LOCAL_PORT`]
-/// (7777) and falling back upward on collision. Each container forward is then
-/// allocated a distinct local port starting from [`FORWARD_LOCAL_PORT_BASE`],
-/// skipping anything already taken — both ports passed in via `reserved` and
-/// ports handed to earlier forwards in this same plan.
-///
-/// `reserved` is an externally-known in-use set (e.g. ports other tunnels hold);
-/// it is treated as read-only and copied internally.
+/// This is the thin wrapper over [`build_tunnel_plan_with`] used when the
+/// dashboard keeps its canonical 7777; pass a custom port to that function to
+/// override it.
 pub fn build_tunnel_plan(
     target: TunnelTarget,
     forwards: Vec<Forward>,
     reserved: &HashSet<u16>,
 ) -> Result<TunnelPlan, TunnelSpecError> {
+    build_tunnel_plan_with(target, forwards, DASHBOARD_LOCAL_PORT, reserved)
+}
+
+/// Build a [`TunnelPlan`] with an explicit dashboard port.
+///
+/// `dashboard_port` is used both as the dashboard's **remote** port (the port
+/// the jonggrang dashboard listens on, behind [`DASHBOARD_FORWARD_HOST`]) and as
+/// the **preferred local** port; on a local collision it falls back upward like
+/// any other forward. Each container forward is then allocated a distinct local
+/// port starting from [`FORWARD_LOCAL_PORT_BASE`], skipping anything already
+/// taken — both ports passed in via `reserved` and ports handed to earlier
+/// forwards in this same plan.
+///
+/// `reserved` is an externally-known in-use set (e.g. ports other tunnels hold);
+/// it is treated as read-only and copied internally.
+pub fn build_tunnel_plan_with(
+    target: TunnelTarget,
+    forwards: Vec<Forward>,
+    dashboard_port: u16,
+    reserved: &HashSet<u16>,
+) -> Result<TunnelPlan, TunnelSpecError> {
     let mut in_use = reserved.clone();
 
-    // Dashboard first, so it keeps the canonical 7777 whenever it is free.
-    let dashboard_local = next_free_local_port(DASHBOARD_LOCAL_PORT, &in_use)?;
+    // Dashboard first, so it keeps its preferred port whenever it is free.
+    let dashboard_local = next_free_local_port(dashboard_port, &in_use)?;
     in_use.insert(dashboard_local);
     let dashboard = AllocatedForward {
         container_id: DASHBOARD_CONTAINER_ID.to_string(),
-        remote_port: DASHBOARD_REMOTE_PORT,
+        remote_port: dashboard_port,
         local_port: dashboard_local,
     };
 
@@ -395,11 +409,13 @@ pub fn parse_forwards_optional(input: &str) -> Result<Vec<Forward>, TunnelSpecEr
 /// always-present 7777 forward).
 ///
 /// `port` overrides the SSH port; `None` keeps the [`DEFAULT_SSH_PORT`] (2222)
-/// that [`parse_target`] assigns.
+/// that [`parse_target`] assigns. `dashboard_port` overrides the dashboard
+/// forward's port; `None` keeps the canonical [`DASHBOARD_LOCAL_PORT`] (7777).
 pub fn build_plan_from_spec(
     target: &str,
     forwards: &str,
     port: Option<u16>,
+    dashboard_port: Option<u16>,
     reserved: &HashSet<u16>,
 ) -> Result<TunnelPlan, TunnelSpecError> {
     let mut target = parse_target(target)?;
@@ -407,7 +423,8 @@ pub fn build_plan_from_spec(
         target.port = port;
     }
     let forwards = parse_forwards_optional(forwards)?;
-    build_tunnel_plan(target, forwards, reserved)
+    let dashboard_port = dashboard_port.unwrap_or(DASHBOARD_LOCAL_PORT);
+    build_tunnel_plan_with(target, forwards, dashboard_port, reserved)
 }
 
 // =====================================================================
@@ -697,7 +714,8 @@ pub fn classify_ssh_log_line(line: &str) -> Option<SshLogSignal> {
 ///  -o ServerAliveInterval=15 -L <local>:<forward-host>:<remote> <user>@<host>`
 ///
 /// The forward host is the dashboard's docker host for the dashboard forward and
-/// the server loopback for container forwards — see [`AllocatedForward::forward_host`].
+/// the container's id (resolved over the server's docker network) for container
+/// forwards — see [`AllocatedForward::forward_host`].
 ///
 /// `BatchMode=yes` keeps a GUI app from hanging on a password prompt (key-only),
 /// and `ExitOnForwardFailure=yes` makes `ssh` exit (rather than linger) if the
@@ -1345,7 +1363,7 @@ mod tests {
     #[test]
     fn build_plan_from_spec_allows_dashboard_only() {
         // No `-c` forwards → a valid plan with just the dashboard forward.
-        let plan = build_plan_from_spec("deploy@srv", "", None, &in_use(&[])).unwrap();
+        let plan = build_plan_from_spec("deploy@srv", "", None, None, &in_use(&[])).unwrap();
         assert_eq!(plan.dashboard.local_port, 7777);
         assert!(plan.forwards.is_empty());
         // No override → the default 2222 SSH port.
@@ -1354,9 +1372,14 @@ mod tests {
 
     #[test]
     fn build_plan_from_spec_end_to_end() {
-        let plan =
-            build_plan_from_spec("deploy@srv.example.com", "-c api:3000", None, &in_use(&[]))
-                .unwrap();
+        let plan = build_plan_from_spec(
+            "deploy@srv.example.com",
+            "-c api:3000",
+            None,
+            None,
+            &in_use(&[]),
+        )
+        .unwrap();
         assert_eq!(plan.target.ssh_target(), "deploy@srv.example.com");
         assert_eq!(plan.dashboard.local_port, 7777);
         assert_eq!(plan.forwards[0].container_id, "api");
@@ -1366,14 +1389,27 @@ mod tests {
 
     #[test]
     fn build_plan_from_spec_honors_port_override() {
-        let plan = build_plan_from_spec("deploy@srv", "", Some(2022), &in_use(&[])).unwrap();
+        let plan = build_plan_from_spec("deploy@srv", "", Some(2022), None, &in_use(&[])).unwrap();
         assert_eq!(plan.target.port, 2022);
+    }
+
+    #[test]
+    fn build_plan_from_spec_honors_dashboard_port_override() {
+        // An explicit dashboard port drives both the preferred local port and
+        // the remote port the dashboard listens on.
+        let plan = build_plan_from_spec("deploy@srv", "", None, Some(8888), &in_use(&[])).unwrap();
+        assert_eq!(plan.dashboard.local_port, 8888);
+        assert_eq!(plan.dashboard.remote_port, 8888);
+        assert_eq!(plan.dashboard.local_url(), "http://localhost:8888");
+        // None → the canonical 7777 is still the default.
+        let default = build_plan_from_spec("deploy@srv", "", None, None, &in_use(&[])).unwrap();
+        assert_eq!(default.dashboard.local_port, DASHBOARD_LOCAL_PORT);
     }
 
     #[test]
     fn build_plan_from_spec_propagates_target_error() {
         assert_eq!(
-            build_plan_from_spec("bogus", "-c web:80", None, &in_use(&[])),
+            build_plan_from_spec("bogus", "-c web:80", None, None, &in_use(&[])),
             Err(TunnelSpecError::MalformedTarget("bogus".to_string()))
         );
     }
@@ -1617,11 +1653,13 @@ mod lifecycle_tests {
             local_port: 7778,
         };
         let args = build_ssh_args(&target(), Path::new("/k"), &fwd);
-        assert!(args.contains(&"7778:localhost:8080".to_string()));
+        // Container forwards target the container by id over the docker network,
+        // not the server's loopback.
+        assert!(args.contains(&"7778:web:8080".to_string()));
     }
 
     #[test]
-    fn forward_host_is_docker_host_only_for_dashboard() {
+    fn forward_host_is_docker_host_for_dashboard_and_container_id_otherwise() {
         let dashboard = AllocatedForward {
             container_id: DASHBOARD_CONTAINER_ID.to_string(),
             remote_port: 7777,
@@ -1629,12 +1667,14 @@ mod lifecycle_tests {
         };
         assert_eq!(dashboard.forward_host(), "host.docker.internal");
 
+        // A container forward resolves against the container's own id (Docker's
+        // embedded DNS), never the server loopback.
         let container = AllocatedForward {
             container_id: "web".to_string(),
             remote_port: 8080,
             local_port: 7778,
         };
-        assert_eq!(container.forward_host(), "localhost");
+        assert_eq!(container.forward_host(), "web");
     }
 
     // ---- status enum / probing -------------------------------------------
@@ -1729,7 +1769,8 @@ mod lifecycle_tests {
     }
 
     fn plan_with(forward_spec: &str) -> TunnelPlan {
-        build_plan_from_spec("deploy@srv.example.com", forward_spec, None, &HashSet::new()).unwrap()
+        build_plan_from_spec("deploy@srv.example.com", forward_spec, None, None, &HashSet::new())
+            .unwrap()
     }
 
     #[test]

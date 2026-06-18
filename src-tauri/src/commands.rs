@@ -62,6 +62,11 @@ pub struct StartTunnelArgs {
     /// listens on.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Port for the always-present dashboard forward — used as both its local
+    /// and remote port. **Optional**: omitted/null falls back to the canonical
+    /// [`crate::tunnel::DASHBOARD_LOCAL_PORT`] (7777).
+    #[serde(default)]
+    pub dashboard_port: Option<u16>,
     /// jonggrang project id used to resolve `~/.jonggrang/web/ssh/<id>.key`
     /// first, then `global.key`, then `~/.ssh/id_rsa`. Optional.
     #[serde(default)]
@@ -159,8 +164,14 @@ pub fn start_tunnel(
     // No externally-reserved ports to avoid — the OS-level probe lives in the
     // lifecycle manager; here we just allocate distinct local ports purely.
     let reserved: HashSet<u16> = HashSet::new();
-    let plan = build_plan_from_spec(&args.target, &args.forwards, args.port, &reserved)
-        .map_err(|e| e.to_string())?;
+    let plan = build_plan_from_spec(
+        &args.target,
+        &args.forwards,
+        args.port,
+        args.dashboard_port,
+        &reserved,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Resolve the key by PATH only — never read its contents into the app.
     let key_path: PathBuf = match args.key_path {
@@ -315,12 +326,13 @@ mod tests {
     #[test]
     fn start_tunnel_args_deserializes_camel_case_with_optionals() {
         let args: StartTunnelArgs = serde_json::from_str(
-            r#"{"target":"deploy@srv","forwards":"-c web:8080","port":2022,"projectId":"proj-1","keyPath":"/k/id"}"#,
+            r#"{"target":"deploy@srv","forwards":"-c web:8080","port":2022,"dashboardPort":8888,"projectId":"proj-1","keyPath":"/k/id"}"#,
         )
         .unwrap();
         assert_eq!(args.target, "deploy@srv");
         assert_eq!(args.forwards, "-c web:8080");
         assert_eq!(args.port, Some(2022));
+        assert_eq!(args.dashboard_port, Some(8888));
         assert_eq!(args.project_id.as_deref(), Some("proj-1"));
         assert_eq!(args.key_path.as_deref(), Some("/k/id"));
     }
@@ -330,6 +342,7 @@ mod tests {
         let args: StartTunnelArgs =
             serde_json::from_str(r#"{"target":"deploy@srv","forwards":"web:80"}"#).unwrap();
         assert!(args.port.is_none());
+        assert!(args.dashboard_port.is_none());
         assert!(args.project_id.is_none());
         assert!(args.key_path.is_none());
     }
