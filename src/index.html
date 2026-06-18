@@ -181,6 +181,20 @@
 
       .empty { color: var(--muted); text-align: center; padding: 28px; }
       .note { color: var(--muted); font-size: 12.5px; margin-top: 14px; }
+
+      .connection-list { display: flex; flex-direction: column; gap: 16px; }
+      .connection { padding: 16px 18px; }
+      .conn-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      .conn-meta { flex: 1; min-width: 0; }
+      .conn-name { font-weight: 700; font-size: 15px; }
+      .conn-sub { color: var(--muted); font-size: 12.5px; margin: 2px 0 4px; }
+      .conn-actions { margin-bottom: 12px; }
+      .conn-actions .spacer { flex: 1; }
     </style>
   </head>
   <body>
@@ -196,11 +210,37 @@
         <button id="error-dismiss" class="icon" type="button">Dismiss</button>
       </div>
 
-      <!-- First-launch setup form -->
+      <!-- Saved connections (one card per jonggrang server) -->
+      <section id="list-view" class="hidden">
+        <div class="toolbar">
+          <button id="add-connection" class="primary" type="button">+ Add connection</button>
+          <button id="refresh-all" class="icon" type="button">Refresh all</button>
+          <span class="spacer"></span>
+        </div>
+
+        <div id="connection-list" class="connection-list"></div>
+        <div id="list-empty" class="empty hidden">
+          No connections yet. Add a jonggrang server to get started.
+        </div>
+
+        <p class="note">
+          Each connection is forwarded independently on its own dashboard port,
+          so several servers can run at the same time.
+        </p>
+      </section>
+
+      <!-- Add / edit a single connection -->
       <section id="setup-view" class="hidden">
         <div class="panel">
-          <h2>Connection setup</h2>
+          <h2 id="setup-title">Add connection</h2>
           <form id="setup-form">
+            <div class="field">
+              <label for="name-input">
+                Connection name <span class="hint">(optional — defaults to the target)</span>
+              </label>
+              <input id="name-input" type="text" placeholder="staging server" autocomplete="off" />
+            </div>
+
             <div class="field">
               <label for="target-input">
                 Server target <span class="hint">&lt;user&gt;@&lt;server&gt;</span>
@@ -217,7 +257,7 @@
 
             <div class="field">
               <label for="dashboard-port-input">
-                Dashboard port <span class="hint">(defaults to 7777)</span>
+                Dashboard port <span class="hint">(auto-assigned from 7777 — change if you like)</span>
               </label>
               <input id="dashboard-port-input" type="text" placeholder="7777" autocomplete="off" />
             </div>
@@ -250,38 +290,13 @@
             </div>
 
             <div class="actions">
-              <button id="setup-submit" class="primary" type="submit">Save &amp; continue</button>
+              <button id="setup-submit" class="primary" type="submit">Save connection</button>
+              <button id="setup-cancel" type="button">Cancel</button>
             </div>
             <p class="note">
-              The dashboard forward (<code>http://localhost:7777</code>) is always added automatically.
+              The dashboard forward is always added automatically on the port above.
             </p>
           </form>
-        </div>
-      </section>
-
-      <!-- Live status dashboard -->
-      <section id="dashboard-view" class="hidden">
-        <div class="panel">
-          <div class="summary">
-            <span>Target: <code id="summary-target"></code></span>
-            <span>Dashboard: <a id="summary-dashboard" class="url" href="#">http://localhost:7777</a></span>
-          </div>
-
-          <div class="toolbar">
-            <button id="start-btn" class="primary" type="button">Start</button>
-            <button id="stop-btn" class="danger" type="button">Stop</button>
-            <button id="refresh-btn" class="icon" type="button">Refresh</button>
-            <span class="spacer"></span>
-            <span id="running-pill" class="running-pill">idle</span>
-            <button id="edit-btn" class="icon" type="button">Edit settings</button>
-          </div>
-
-          <div id="forward-list" class="forward-list"></div>
-
-          <p class="note">
-            Start/Stop control all forwards together (the backend manages the
-            tunnel as one unit). Each card links to its local URL.
-          </p>
         </div>
       </section>
     </main>

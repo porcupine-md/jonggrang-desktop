@@ -15,7 +15,7 @@
 //! only on `std` (no `serde`/`tauri`); serialization for the Tauri bridge is
 //! layered on in a later task if needed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::io::{BufRead, BufReader};
@@ -1074,6 +1074,120 @@ impl Default for TunnelManager {
     }
 }
 
+// =====================================================================
+// Multi-connection registry
+// =====================================================================
+//
+// The desktop app lets the user save several jonggrang server "connections",
+// each forwarded independently and reachable on its own dashboard port. Every
+// connection gets its own [`TunnelManager`] (its own `ssh -L` children), keyed
+// by a caller-supplied connection id, so multiple servers can be tunneled at
+// the same time without their local forward ports colliding.
+
+/// A registry of independent tunnels — one [`TunnelManager`] per saved
+/// connection, keyed by a stable connection id supplied by the webview.
+///
+/// Held behind a `Mutex` (mutable from `&self` Tauri commands) inside an `Arc`
+/// (shared with the exit hook); see [`SharedTunnelRegistry`].
+pub struct TunnelRegistry {
+    connections: HashMap<String, TunnelManager>,
+}
+
+/// The intended shared form of the registry: a `Mutex` (for `&self` command
+/// mutation) inside an `Arc` (shared between command handlers and the exit hook).
+pub type SharedTunnelRegistry = Arc<Mutex<TunnelRegistry>>;
+
+impl TunnelRegistry {
+    /// An empty registry with no connections.
+    pub fn new() -> Self {
+        TunnelRegistry {
+            connections: HashMap::new(),
+        }
+    }
+
+    /// Every local port currently allocated by connections *other than*
+    /// `except`. Passed as the `reserved` set when building a connection's plan
+    /// so a freshly-started tunnel never reuses a local port another live
+    /// connection already holds (the dashboard then bumps up off a clash).
+    pub fn local_ports_excluding(&mut self, except: &str) -> HashSet<u16> {
+        let mut ports = HashSet::new();
+        for (id, mgr) in self.connections.iter_mut() {
+            if id == except {
+                continue;
+            }
+            for health in mgr.health() {
+                ports.insert(health.local_port);
+            }
+        }
+        ports
+    }
+
+    /// Start (or restart) the tunnel for `connection_id`, creating its manager on
+    /// first use. Delegates to [`TunnelManager::start`].
+    pub fn start(
+        &mut self,
+        connection_id: &str,
+        plan: &TunnelPlan,
+        key_path: &Path,
+    ) -> Result<(), TunnelError> {
+        self.start_with(connection_id, plan, key_path, spawn_forward)
+    }
+
+    /// Spawn machinery behind [`TunnelRegistry::start`], parameterized by the
+    /// per-forward spawn function so tests can inject a stand-in child program
+    /// (mirrors [`TunnelManager::start_with`]).
+    fn start_with<F>(
+        &mut self,
+        connection_id: &str,
+        plan: &TunnelPlan,
+        key_path: &Path,
+        spawn: F,
+    ) -> Result<(), TunnelError>
+    where
+        F: Fn(&TunnelTarget, &Path, &AllocatedForward) -> std::io::Result<ForwardProcess>,
+    {
+        let mgr = self
+            .connections
+            .entry(connection_id.to_string())
+            .or_default();
+        mgr.start_with(plan, key_path, spawn)
+    }
+
+    /// Stop the tunnel for `connection_id` (no-op if unknown or already idle).
+    pub fn stop(&mut self, connection_id: &str) {
+        if let Some(mgr) = self.connections.get_mut(connection_id) {
+            mgr.stop();
+        }
+    }
+
+    /// Stop every tracked connection. Used by the app exit hook so no `ssh`
+    /// child survives shutdown.
+    pub fn stop_all(&mut self) {
+        for mgr in self.connections.values_mut() {
+            mgr.stop();
+        }
+    }
+
+    /// Whether the named connection currently has any forward child tracked.
+    pub fn is_running(&self, connection_id: &str) -> bool {
+        self.connections
+            .get(connection_id)
+            .map_or(false, |m| m.is_running())
+    }
+
+    /// Health snapshot for one connection, or `None` if the registry has never
+    /// seen `connection_id`.
+    pub fn health(&mut self, connection_id: &str) -> Option<Vec<ForwardHealth>> {
+        self.connections.get_mut(connection_id).map(|m| m.health())
+    }
+}
+
+impl Default for TunnelRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1857,6 +1971,81 @@ mod lifecycle_tests {
         assert!(all_failed, "exited-nonzero children must reconcile to Failed");
 
         mgr.stop();
+        let _ = std::fs::remove_file(&key);
+    }
+
+    // ---- multi-connection registry ---------------------------------------
+
+    #[test]
+    fn registry_runs_two_connections_with_distinct_ports() {
+        let key = temp_key_0600("registry-two");
+        let mut reg = TunnelRegistry::new();
+
+        // Connection "a": dashboard keeps the canonical 7777.
+        let plan_a = plan_with("-c web:8080");
+        assert_eq!(plan_a.dashboard.local_port, 7777);
+        reg.start_with("a", &plan_a, &key, spawn_sleeper).unwrap();
+        assert!(reg.is_running("a"));
+
+        // Connection "b": reserve A's live ports so B's dashboard bumps off 7777.
+        let reserved = reg.local_ports_excluding("b");
+        assert!(reserved.contains(&7777), "A's dashboard port must be reserved");
+        let plan_b =
+            build_plan_from_spec("deploy@srv-b", "-c api:3000", None, None, &reserved).unwrap();
+        assert_ne!(
+            plan_b.dashboard.local_port, plan_a.dashboard.local_port,
+            "two connections must not share a dashboard port"
+        );
+        reg.start_with("b", &plan_b, &key, spawn_sleeper).unwrap();
+
+        // Both run concurrently.
+        assert!(reg.is_running("a"));
+        assert!(reg.is_running("b"));
+
+        // Stopping one leaves the other running.
+        reg.stop("a");
+        assert!(!reg.is_running("a"));
+        assert!(reg.is_running("b"));
+
+        reg.stop_all();
+        assert!(!reg.is_running("b"));
+
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn registry_health_is_per_connection() {
+        let key = temp_key_0600("registry-health");
+        let mut reg = TunnelRegistry::new();
+
+        // An unknown connection has no health snapshot.
+        assert!(reg.health("missing").is_none());
+
+        // A dashboard-only connection tracks exactly one forward.
+        reg.start_with("a", &plan_with(""), &key, spawn_sleeper).unwrap();
+        let health = reg.health("a").expect("connection a exists");
+        assert_eq!(health.len(), 1, "dashboard-only connection tracks one forward");
+        assert_eq!(health[0].container_id, DASHBOARD_CONTAINER_ID);
+
+        reg.stop_all();
+        let _ = std::fs::remove_file(&key);
+    }
+
+    #[test]
+    fn registry_local_ports_excluding_skips_named_connection() {
+        let key = temp_key_0600("registry-ports");
+        let mut reg = TunnelRegistry::new();
+        reg.start_with("a", &plan_with("-c web:8080"), &key, spawn_sleeper)
+            .unwrap();
+
+        // Excluding "a" itself yields nothing (its own ports are free to reuse).
+        assert!(reg.local_ports_excluding("a").is_empty());
+        // Excluding a different id surfaces A's allocated local ports (7777, 7778).
+        let others = reg.local_ports_excluding("b");
+        assert!(others.contains(&7777));
+        assert!(others.contains(&7778));
+
+        reg.stop_all();
         let _ = std::fs::remove_file(&key);
     }
 }

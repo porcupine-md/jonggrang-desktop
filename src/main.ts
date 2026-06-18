@@ -1,10 +1,15 @@
 /**
- * Jonggrang Tunnel — webview frontend (task-006).
+ * Jonggrang Tunnel — webview frontend.
  *
  * This module is the dashboard UI. It contains NO tunnel logic of its own: it
- * only drives the Rust `#[tauri::command]` handlers from task-005
- * (`start_tunnel` / `stop_tunnel` / `tunnel_status` / `list_forwards`) and
- * listens for the live `tunnel-status` event to keep the view in sync.
+ * only drives the Rust `#[tauri::command]` handlers
+ * (`start_tunnel` / `stop_tunnel` / `tunnel_status` / `list_forwards` /
+ * `open_dashboard`) and listens for the live `tunnel-status` event to keep the
+ * view in sync.
+ *
+ * It manages a list of saved **connections** (one per jonggrang server). Each
+ * connection is forwarded independently on its own dashboard port — the backend
+ * keys every command by `connectionId` — so several servers can run at once.
  *
  * ## How the Tauri API is reached
  * The project uses a no-bundler static frontend (`frontendDist: "../src"`), so
@@ -39,10 +44,12 @@ declare global {
 
 // ---- constants -------------------------------------------------------------
 
-/** Event emitted by the backend after every tunnel state change (task-005). */
+/** Event emitted by the backend after every tunnel state change. */
 const TUNNEL_STATUS_EVENT = "tunnel-status";
-/** localStorage key holding the persisted setup config (paths only, no secrets). */
-const STORAGE_KEY = "jonggrang.tunnel.config.v1";
+/** localStorage key holding the saved connections (paths only, no secrets). */
+const STORAGE_KEY = "jonggrang.tunnel.connections.v1";
+/** Older single-connection key, migrated into one connection on first load. */
+const LEGACY_STORAGE_KEY = "jonggrang.tunnel.config.v1";
 /** Container id the backend uses for the always-present dashboard forward. */
 const DASHBOARD_CONTAINER_ID = "dashboard";
 /** Default SSH port (the jonggrang server's sshd); mirrors the backend default. */
@@ -69,18 +76,23 @@ interface ForwardView {
 }
 
 interface TunnelStatus {
+  connectionId: string;
   running: boolean;
   forwards: ForwardView[];
 }
 
-// ---- persisted setup config ------------------------------------------------
+// ---- persisted connections -------------------------------------------------
 
 interface ContainerForward {
   containerId: string;
   remotePort: number;
 }
 
-interface TunnelConfig {
+interface TunnelConnection {
+  /** Stable id; doubles as the backend `connectionId`. */
+  id: string;
+  /** Display name (defaults to the target). */
+  name: string;
   target: string;
   port: number;
   dashboardPort: number;
@@ -123,45 +135,106 @@ function setHidden(node: HTMLElement, hidden: boolean): void {
   node.classList.toggle("hidden", hidden);
 }
 
+/** A stable, collision-free connection id. */
+function newConnectionId(): string {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") {
+    return `conn-${c.randomUUID()}`;
+  }
+  // Fallback for older webviews — only needs in-app uniqueness.
+  return `conn-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+}
+
+// ---- forward / connection validation helpers -------------------------------
+
+function isContainerForward(f: unknown): f is ContainerForward {
+  return (
+    !!f &&
+    typeof (f as ContainerForward).containerId === "string" &&
+    typeof (f as ContainerForward).remotePort === "number"
+  );
+}
+
+function asValidPort(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535
+    ? value
+    : fallback;
+}
+
 // ---- config persistence ----------------------------------------------------
 
-function readConfig(): TunnelConfig | null {
-  const raw = window.localStorage.getItem(STORAGE_KEY);
-  if (!raw) {
+/** Coerce a loosely-typed parsed object into a well-formed connection. */
+function normalizeConnection(raw: Partial<TunnelConnection>): TunnelConnection | null {
+  if (typeof raw.target !== "string" || !Array.isArray(raw.forwards)) {
     return null;
   }
+  return {
+    id: typeof raw.id === "string" && raw.id ? raw.id : newConnectionId(),
+    name: typeof raw.name === "string" && raw.name ? raw.name : raw.target,
+    target: raw.target,
+    port: asValidPort(raw.port, DEFAULT_SSH_PORT),
+    dashboardPort: asValidPort(raw.dashboardPort, DEFAULT_DASHBOARD_PORT),
+    keyPath: typeof raw.keyPath === "string" ? raw.keyPath : "",
+    projectId: typeof raw.projectId === "string" ? raw.projectId : "",
+    forwards: raw.forwards.filter(isContainerForward),
+  };
+}
+
+/** Migrate a legacy single-connection config into a one-element list. */
+function migrateLegacyConfig(): TunnelConnection[] {
+  const raw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+  if (!raw) {
+    return [];
+  }
   try {
-    const parsed = JSON.parse(raw) as Partial<TunnelConfig>;
-    if (typeof parsed.target !== "string" || !Array.isArray(parsed.forwards)) {
-      return null;
-    }
-    return {
-      target: parsed.target,
-      port:
-        typeof parsed.port === "number" && Number.isInteger(parsed.port)
-          ? parsed.port
-          : DEFAULT_SSH_PORT,
-      dashboardPort:
-        typeof parsed.dashboardPort === "number" &&
-        Number.isInteger(parsed.dashboardPort)
-          ? parsed.dashboardPort
-          : DEFAULT_DASHBOARD_PORT,
-      keyPath: typeof parsed.keyPath === "string" ? parsed.keyPath : "",
-      projectId: typeof parsed.projectId === "string" ? parsed.projectId : "",
-      forwards: parsed.forwards.filter(
-        (f): f is ContainerForward =>
-          !!f &&
-          typeof f.containerId === "string" &&
-          typeof f.remotePort === "number",
-      ),
-    };
+    const conn = normalizeConnection(JSON.parse(raw) as Partial<TunnelConnection>);
+    return conn ? [conn] : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
-function saveConfig(config: TunnelConfig): void {
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+function readConnections(): TunnelConnection[] {
+  const raw = window.localStorage.getItem(STORAGE_KEY);
+  if (!raw) {
+    const migrated = migrateLegacyConfig();
+    if (migrated.length) {
+      saveConnections(migrated);
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    }
+    return migrated;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<TunnelConnection>[];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .map((c) => normalizeConnection(c))
+      .filter((c): c is TunnelConnection => c !== null);
+  } catch {
+    return [];
+  }
+}
+
+function saveConnections(connections: TunnelConnection[]): void {
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(connections));
+}
+
+/**
+ * The next free dashboard port at or above 7777, skipping ports already taken
+ * by other connections, so a freshly-added connection auto-assigns a distinct
+ * port. The field stays editable.
+ */
+function nextDashboardPort(connections: TunnelConnection[], excludeId?: string): number {
+  const used = new Set(
+    connections.filter((c) => c.id !== excludeId).map((c) => c.dashboardPort),
+  );
+  let port = DEFAULT_DASHBOARD_PORT;
+  while (used.has(port) && port < 65535) {
+    port += 1;
+  }
+  return port;
 }
 
 /**
@@ -246,7 +319,8 @@ function collectForwards(): ContainerForward[] {
   return forwards;
 }
 
-function readSetupForm(): TunnelConfig {
+/** Read + validate the setup form into a connection (keeping the given id). */
+function readSetupForm(id: string): TunnelConnection {
   const target = byId<HTMLInputElement>("target-input").value.trim();
   if (!/^[^@\s]+@[^@\s]+$/.test(target)) {
     throw new Error('Server target must look like "<user>@<server>".');
@@ -270,10 +344,13 @@ function readSetupForm(): TunnelConfig {
       `Invalid dashboard port: "${dashboardText}" (expected 1-65535).`,
     );
   }
+  const name = byId<HTMLInputElement>("name-input").value.trim();
   // Container forwards are optional — with none, the backend still opens the
-  // always-present dashboard forward (http://localhost:<dashboardPort>).
+  // always-present dashboard forward.
   const forwards = collectForwards();
   return {
+    id,
+    name: name || target,
     target,
     port,
     dashboardPort,
@@ -283,18 +360,19 @@ function readSetupForm(): TunnelConfig {
   };
 }
 
-function populateSetupForm(config: TunnelConfig | null): void {
-  byId<HTMLInputElement>("target-input").value = config?.target ?? "";
+function populateSetupForm(connection: TunnelConnection | null): void {
+  byId<HTMLInputElement>("name-input").value = connection?.name ?? "";
+  byId<HTMLInputElement>("target-input").value = connection?.target ?? "";
   byId<HTMLInputElement>("port-input").value = String(
-    config?.port ?? DEFAULT_SSH_PORT,
+    connection?.port ?? DEFAULT_SSH_PORT,
   );
   byId<HTMLInputElement>("dashboard-port-input").value = String(
-    config?.dashboardPort ?? DEFAULT_DASHBOARD_PORT,
+    connection?.dashboardPort ?? nextDashboardPort(connections),
   );
-  byId<HTMLInputElement>("key-input").value = config?.keyPath ?? "";
-  byId<HTMLInputElement>("project-input").value = config?.projectId ?? "";
+  byId<HTMLInputElement>("key-input").value = connection?.keyPath ?? "";
+  byId<HTMLInputElement>("project-input").value = connection?.projectId ?? "";
   byId("forward-rows").replaceChildren();
-  const seeds = config?.forwards.length ? config.forwards : [undefined];
+  const seeds = connection?.forwards.length ? connection.forwards : [undefined];
   for (const seed of seeds) {
     addForwardRow(seed);
   }
@@ -327,13 +405,9 @@ function statusLabel(status: string): string {
   return STATUS_LABELS[status] ?? status;
 }
 
-/**
- * Open the jonggrang dashboard inside its own in-app webview window (at
- * http://localhost:7777) via the backend `open_dashboard` command, instead of
- * handing it off to an external browser.
- */
-async function openDashboardWindow(): Promise<void> {
-  await invokeCommand<void>("open_dashboard");
+/** Open one connection's jonggrang dashboard in its own in-app webview window. */
+async function openDashboardWindow(connectionId: string): Promise<void> {
+  await invokeCommand<void>("open_dashboard", { connectionId });
 }
 
 async function openLocalUrl(url: string): Promise<void> {
@@ -347,7 +421,10 @@ async function openLocalUrl(url: string): Promise<void> {
   window.open(url, "_blank");
 }
 
-function renderForwardCard(forward: ForwardView): HTMLElement {
+function renderForwardCard(
+  connection: TunnelConnection,
+  forward: ForwardView,
+): HTMLElement {
   const card = document.createElement("div");
   card.className = "forward-card";
 
@@ -357,7 +434,8 @@ function renderForwardCard(forward: ForwardView): HTMLElement {
   const name = document.createElement("div");
   name.className = "name";
   name.textContent = forward.containerId;
-  if (forward.containerId === DASHBOARD_CONTAINER_ID) {
+  const isDashboard = forward.containerId === DASHBOARD_CONTAINER_ID;
+  if (isDashboard) {
     const tag = document.createElement("span");
     tag.className = "tag";
     tag.textContent = "dashboard";
@@ -371,10 +449,9 @@ function renderForwardCard(forward: ForwardView): HTMLElement {
   link.addEventListener("click", (event) => {
     event.preventDefault();
     // The dashboard forward opens in-app; other forwards open externally.
-    const opened =
-      forward.containerId === DASHBOARD_CONTAINER_ID
-        ? openDashboardWindow()
-        : openLocalUrl(forward.localUrl);
+    const opened = isDashboard
+      ? openDashboardWindow(connection.id)
+      : openLocalUrl(forward.localUrl);
     opened.catch((err) => showError(String(err)));
   });
 
@@ -403,49 +480,142 @@ function renderForwardCard(forward: ForwardView): HTMLElement {
   return card;
 }
 
-function applyStatus(status: TunnelStatus): void {
-  const pill = byId("running-pill");
-  pill.textContent = status.running ? "running" : "idle";
-  pill.classList.toggle("on", status.running);
+/** Render one connection panel (header + actions + live forward list). */
+function renderConnectionCard(connection: TunnelConnection): HTMLElement {
+  const status = statuses.get(connection.id);
+  const running = status?.running ?? false;
 
-  byId<HTMLButtonElement>("start-btn").disabled = status.running;
-  byId<HTMLButtonElement>("stop-btn").disabled = !status.running;
+  const panel = document.createElement("div");
+  panel.className = "panel connection";
 
-  const list = byId("forward-list");
-  list.replaceChildren();
-  if (status.forwards.length === 0) {
+  // --- header (name / target / dashboard link / running pill) ---
+  const head = document.createElement("div");
+  head.className = "conn-head";
+
+  const meta = document.createElement("div");
+  meta.className = "conn-meta";
+
+  const nameEl = document.createElement("div");
+  nameEl.className = "conn-name";
+  nameEl.textContent = connection.name;
+
+  const sub = document.createElement("div");
+  sub.className = "conn-sub";
+  sub.textContent = `${connection.target} · SSH ${connection.port}`;
+
+  const dashUrl = `http://localhost:${connection.dashboardPort}`;
+  const dashLink = document.createElement("a");
+  dashLink.className = "url";
+  dashLink.href = dashUrl;
+  dashLink.textContent = dashUrl;
+  dashLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    openDashboardWindow(connection.id).catch((err) => showError(String(err)));
+  });
+
+  meta.append(nameEl, sub, dashLink);
+
+  const pill = document.createElement("span");
+  pill.className = `running-pill${running ? " on" : ""}`;
+  pill.textContent = running ? "running" : "idle";
+
+  head.append(meta, pill);
+
+  // --- action buttons ---
+  const actions = document.createElement("div");
+  actions.className = "toolbar conn-actions";
+
+  const startBtn = document.createElement("button");
+  startBtn.className = "primary";
+  startBtn.textContent = "Start";
+  startBtn.disabled = running;
+  startBtn.addEventListener("click", () => {
+    startConnection(connection).catch((err) => showError(String(err)));
+  });
+
+  const stopBtn = document.createElement("button");
+  stopBtn.className = "danger";
+  stopBtn.textContent = "Stop";
+  stopBtn.disabled = !running;
+  stopBtn.addEventListener("click", () => {
+    stopConnection(connection).catch((err) => showError(String(err)));
+  });
+
+  const refreshBtn = document.createElement("button");
+  refreshBtn.className = "icon";
+  refreshBtn.textContent = "Refresh";
+  refreshBtn.addEventListener("click", () => {
+    refreshConnection(connection).catch((err) => showError(String(err)));
+  });
+
+  const editBtn = document.createElement("button");
+  editBtn.className = "icon";
+  editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => showSetup(connection));
+
+  const removeBtn = document.createElement("button");
+  removeBtn.className = "icon danger";
+  removeBtn.textContent = "Remove";
+  removeBtn.addEventListener("click", () => {
+    removeConnection(connection).catch((err) => showError(String(err)));
+  });
+
+  const spacer = document.createElement("span");
+  spacer.className = "spacer";
+
+  actions.append(startBtn, stopBtn, refreshBtn, spacer, editBtn, removeBtn);
+
+  // --- forward list ---
+  const list = document.createElement("div");
+  list.className = "forward-list";
+  const forwards = status?.forwards ?? [];
+  if (forwards.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = 'No active forwards. Press "Start" to open the tunnel.';
     list.append(empty);
-    return;
+  } else {
+    for (const forward of forwards) {
+      list.append(renderForwardCard(connection, forward));
+    }
   }
-  for (const forward of status.forwards) {
-    list.append(renderForwardCard(forward));
+
+  panel.append(head, actions, list);
+  return panel;
+}
+
+function renderList(): void {
+  const list = byId("connection-list");
+  list.replaceChildren();
+  setHidden(byId("list-empty"), connections.length > 0);
+  for (const connection of connections) {
+    list.append(renderConnectionCard(connection));
   }
 }
 
 // ---- command drivers -------------------------------------------------------
 
-async function startTunnel(config: TunnelConfig): Promise<void> {
+async function startConnection(connection: TunnelConnection): Promise<void> {
   clearError();
   try {
     // Matches StartTunnelArgs (camelCase serde fields). Empty optionals are
     // omitted so the backend falls back to its key-resolution precedence.
     const args: Record<string, unknown> = {
-      target: config.target,
-      forwards: buildForwardsSpec(config.forwards),
-      port: config.port,
-      dashboardPort: config.dashboardPort,
+      connectionId: connection.id,
+      target: connection.target,
+      forwards: buildForwardsSpec(connection.forwards),
+      port: connection.port,
+      dashboardPort: connection.dashboardPort,
     };
-    if (config.keyPath) {
-      args.keyPath = config.keyPath;
+    if (connection.keyPath) {
+      args.keyPath = connection.keyPath;
     }
-    if (config.projectId) {
-      args.projectId = config.projectId;
+    if (connection.projectId) {
+      args.projectId = connection.projectId;
     }
     const status = await invokeCommand<TunnelStatus>("start_tunnel", { args });
-    applyStatus(status);
+    statuses.set(status.connectionId, status);
+    renderList();
   } catch (err) {
     // Backend errors arrive as plain strings — including the SSH key
     // 0600/owner permission gotcha — and are shown verbatim to the user.
@@ -453,51 +623,69 @@ async function startTunnel(config: TunnelConfig): Promise<void> {
   }
 }
 
-async function stopTunnel(): Promise<void> {
+async function stopConnection(connection: TunnelConnection): Promise<void> {
   clearError();
-  try {
-    const status = await invokeCommand<TunnelStatus>("stop_tunnel");
-    applyStatus(status);
-  } catch (err) {
-    showError(String(err));
-  }
+  const status = await invokeCommand<TunnelStatus>("stop_tunnel", {
+    connectionId: connection.id,
+  });
+  statuses.set(status.connectionId, status);
+  renderList();
 }
 
-async function refreshStatus(): Promise<void> {
-  try {
-    const status = await invokeCommand<TunnelStatus>("tunnel_status");
-    applyStatus(status);
-  } catch (err) {
-    showError(String(err));
-  }
+async function refreshConnection(connection: TunnelConnection): Promise<void> {
+  const status = await invokeCommand<TunnelStatus>("tunnel_status", {
+    connectionId: connection.id,
+  });
+  statuses.set(status.connectionId, status);
+  renderList();
+}
+
+async function refreshAll(): Promise<void> {
+  await Promise.all(
+    connections.map((c) =>
+      refreshConnection(c).catch((err) => showError(String(err))),
+    ),
+  );
+}
+
+async function removeConnection(connection: TunnelConnection): Promise<void> {
+  clearError();
+  // Tear the tunnel down first so removing a card never leaks `ssh` children.
+  await invokeCommand<TunnelStatus>("stop_tunnel", {
+    connectionId: connection.id,
+  }).catch(() => {
+    /* stopping is best-effort during removal */
+  });
+  statuses.delete(connection.id);
+  connections = connections.filter((c) => c.id !== connection.id);
+  saveConnections(connections);
+  renderList();
 }
 
 // ---- view switching --------------------------------------------------------
 
-function showSetup(config: TunnelConfig | null): void {
-  populateSetupForm(config);
-  setHidden(byId("dashboard-view"), true);
-  setHidden(byId("setup-view"), false);
+function showList(): void {
+  renderList();
+  setHidden(byId("setup-view"), true);
+  setHidden(byId("list-view"), false);
 }
 
-function showDashboard(config: TunnelConfig): void {
-  byId("summary-target").textContent = config.target;
-  // Reflect the configured dashboard port in the summary link (the live URL
-  // after start comes from the backend, in case the port was bumped on a
-  // collision).
-  const dashboardLink = byId<HTMLAnchorElement>("summary-dashboard");
-  const dashboardUrl = `http://localhost:${config.dashboardPort}`;
-  dashboardLink.href = dashboardUrl;
-  dashboardLink.textContent = dashboardUrl;
-  setHidden(byId("setup-view"), true);
-  setHidden(byId("dashboard-view"), false);
-  // Reflect the current backend state immediately (it survives webview reloads).
-  refreshStatus();
+function showSetup(connection: TunnelConnection | null): void {
+  editingId = connection?.id ?? null;
+  byId("setup-title").textContent = connection
+    ? "Edit connection"
+    : "Add connection";
+  populateSetupForm(connection);
+  setHidden(byId("list-view"), true);
+  setHidden(byId("setup-view"), false);
 }
 
 // ---- wiring ----------------------------------------------------------------
 
-let activeConfig: TunnelConfig | null = null;
+let connections: TunnelConnection[] = [];
+const statuses = new Map<string, TunnelStatus>();
+/** Id of the connection being edited, or null when adding a new one. */
+let editingId: string | null = null;
 let unlistenStatus: UnlistenFn | null = null;
 
 async function subscribeToStatusEvents(): Promise<void> {
@@ -506,7 +694,13 @@ async function subscribeToStatusEvents(): Promise<void> {
   }
   unlistenStatus = await getTauri().event.listen<TunnelStatus>(
     TUNNEL_STATUS_EVENT,
-    (event) => applyStatus(event.payload),
+    (event) => {
+      statuses.set(event.payload.connectionId, event.payload);
+      // Only re-render when the list is the visible view.
+      if (!byId("list-view").classList.contains("hidden")) {
+        renderList();
+      }
+    },
   );
 }
 
@@ -515,44 +709,42 @@ function wireSetupForm(): void {
   byId("key-browse").addEventListener("click", () => {
     pickKeyPath().catch((err) => showError(String(err)));
   });
+  byId("setup-cancel").addEventListener("click", () => {
+    clearError();
+    showList();
+  });
   byId<HTMLFormElement>("setup-form").addEventListener("submit", (event) => {
     event.preventDefault();
     clearError();
     try {
-      activeConfig = readSetupForm();
-      saveConfig(activeConfig);
-      showDashboard(activeConfig);
+      const id = editingId ?? newConnectionId();
+      const connection = readSetupForm(id);
+      const existing = connections.findIndex((c) => c.id === id);
+      if (existing >= 0) {
+        connections[existing] = connection;
+      } else {
+        connections.push(connection);
+      }
+      saveConnections(connections);
+      editingId = null;
+      showList();
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
     }
   });
 }
 
-function wireDashboard(): void {
-  byId("start-btn").addEventListener("click", () => {
-    if (activeConfig) {
-      startTunnel(activeConfig);
-    }
-  });
-  byId("stop-btn").addEventListener("click", () => {
-    stopTunnel();
-  });
-  byId("refresh-btn").addEventListener("click", () => {
-    refreshStatus();
-  });
-  byId("edit-btn").addEventListener("click", () => {
-    showSetup(activeConfig);
-  });
-  byId("summary-dashboard").addEventListener("click", (event) => {
-    event.preventDefault();
-    openDashboardWindow().catch((err) => showError(String(err)));
+function wireListView(): void {
+  byId("add-connection").addEventListener("click", () => showSetup(null));
+  byId("refresh-all").addEventListener("click", () => {
+    refreshAll().catch((err) => showError(String(err)));
   });
   byId("error-dismiss").addEventListener("click", () => clearError());
 }
 
 async function init(): Promise<void> {
   wireSetupForm();
-  wireDashboard();
+  wireListView();
 
   try {
     await subscribeToStatusEvents();
@@ -560,12 +752,10 @@ async function init(): Promise<void> {
     showError(`Failed to subscribe to live status: ${String(err)}`);
   }
 
-  activeConfig = readConfig();
-  if (activeConfig) {
-    showDashboard(activeConfig);
-  } else {
-    showSetup(null);
-  }
+  connections = readConnections();
+  showList();
+  // Reflect the current backend state (tunnels survive webview reloads).
+  refreshAll().catch((err) => showError(String(err)));
 }
 
 window.addEventListener("DOMContentLoaded", () => {
