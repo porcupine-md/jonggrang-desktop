@@ -1810,13 +1810,26 @@ mod lifecycle_tests {
 
     #[test]
     fn probe_unbound_port_is_false() {
-        // Reserve a port via a listener to learn a free one, drop it, then probe:
-        // nothing is listening, so the probe must report false — no live SSH or
-        // server required.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(!probe_local_port(port));
+        // Find a port nothing listens on and confirm the probe reports it closed.
+        // Binding then dropping a listener yields a port that *should* be free,
+        // but on a busy CI host that exact ephemeral port can be reused (or still
+        // be lingering in TIME_WAIT) before we probe, so the connect occasionally
+        // succeeds. Retry a few fresh ports to dodge that rare race rather than
+        // flake — a genuinely closed port must probe false on at least one try.
+        let mut probed_closed = false;
+        for _ in 0..10 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            if !probe_local_port(port) {
+                probed_closed = true;
+                break;
+            }
+        }
+        assert!(
+            probed_closed,
+            "a port with nothing listening must probe as closed"
+        );
     }
 
     // ---- manager basics & Send+Sync --------------------------------------
